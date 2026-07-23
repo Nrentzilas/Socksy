@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          bash -n bin/socksy
+          bash -n completions/socksy.bash
+          bash -n install.sh uninstall.sh
+      - name: Unit tests (no dependencies)
+        run: bash test/run.sh
+      - name: Unit tests (bats, if available)
+        run: |
+          if command -v bats >/dev/null 2>&1; then
+            bats test/
+          else
+            echo "bats not installed on runner, skipping (test/run.sh already covered it)"
+          fi

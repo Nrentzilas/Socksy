@@ -1,0 +1,13 @@
+
+*.tmp
+*.swp
+*~
+.DS_Store
+
+gost
+profiles
+last
+
+*.mp4
+
+ROADMAP.md

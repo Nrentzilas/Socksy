@@ -1,0 +1,3 @@
+# SC2015: `a && b || c` is used intentionally throughout, only where the middle
+# command cannot fail (echo/printf), so it is not meant as if-then-else.
+disable=SC2015

@@ -1,0 +1,162 @@
+.\" Manpage for socksy.
+.TH SOCKSY 1 "2026-07-23" "socksy 0.1.0" "User Commands"
+.SH NAME
+socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on GNOME
+.SH SYNOPSIS
+.B socksy
+.I command
+.RI [ options ]
+.RI [ 'user:pass@host:port' ]
+.SH DESCRIPTION
+GNOME's system proxy settings cannot send a SOCKS username and password.
+.B socksy
+works around this by running a small local relay
+.RB ( gost )
+that injects your credentials and forwards traffic upstream, then points GNOME's
+system proxy at the local relay
+.RB ( 127.0.0.1:1081
+by default).
+.PP
+Everything lives under
+.I ~/.local
+and
+.IR ~/.config ;
+no root is required. The relay runs as a systemd user service, so it survives
+logout and restarts on failure.
+.SH COMMANDS
+.TP
+.BI "set [--type " t "] [--country " XX "] [--sticky|--session " id "] '" proxy "'"
+Apply a proxy now. Installs gost on first use and auto-tests the exit IP.
+.TP
+.B on
+Re-apply the last proxy.
+.TP
+.B off
+Turn the proxy off (back to a direct connection).
+.TP
+.BR "status " [ --json ]
+Show what is active. With
+.B --json
+print machine-readable output.
+.TP
+.B test
+Print the current exit IP.
+.TP
+.BI "watch " [seconds]
+Live exit-IP loop (default 5s); flags every change.
+.TP
+.BR "watchdog " { on | off | status }
+Auto-restart the relay when the exit goes bad (systemd user timer).
+.TP
+.BR "dns " { on | off | status }
+Remote DNS for Firefox (stops DNS leaks). CLI, GNOME apps and Chrome already
+resolve remotely.
+.TP
+.BR "bypass " { list | add | rm | reset }
+Manage the GNOME no-proxy
+.RB ( ignore-hosts )
+list.
+.TP
+.BI "save " "name '" proxy "'"
+Remember a proxy under a name.
+.TP
+.BR "use " [ name ]
+Apply a saved proxy (no name = last used).
+.TP
+.B list
+List saved proxies (passwords masked).
+.TP
+.BI "rm " name
+Forget a saved proxy.
+.SH SET FLAGS
+.TP
+.BI "--type " t
+Upstream type:
+.BR socks5 " (default), " http ", or " https .
+.TP
+.BI "--country " XX
+Append a country tag to the username, e.g.
+.BR "--country GR" .
+.TP
+.B --sticky
+Append a random session tag so your exit IP stays put.
+.TP
+.BI "--session " id
+Reuse a specific session tag (same id = same IP window).
+.SH CONFIG FILE
+.I ~/.config/socksy/config
+holds optional
+.RI ' "key = value" '
+defaults (parsed, never executed). Recognised keys:
+.BR local_port ", " gost_version ", " session_keyword ", " country_keyword ", "
+.BR type ", " ignore_hosts ", " health_interval ", " health_fails ", " health_url .
+Precedence is environment variable, then config file, then built-in default.
+.SH ENVIRONMENT
+.TP
+.B SOCKSY_LOCAL_PORT
+Local relay listen port (default 1081).
+.TP
+.B SOCKSY_SESSION_KEYWORD ", " SOCKSY_COUNTRY_KEYWORD
+Provider-specific tag keywords (defaults
+.IR -session- " / " -country- ).
+.TP
+.B SOCKSY_TYPE
+Default upstream type.
+.TP
+.B SOCKSY_HEALTH_INTERVAL ", " SOCKSY_HEALTH_FAILS ", " SOCKSY_HEALTH_URL
+Watchdog probe cadence, failure threshold, and probe URL.
+.SH FILES
+.TP
+.I ~/.local/bin/socksy
+The command.
+.TP
+.I ~/.local/bin/gost
+The relay binary.
+.TP
+.I ~/.config/systemd/user/socksy-relay.service
+The relay service.
+.TP
+.I ~/.config/systemd/user/socksy-watchdog.{service,timer}
+The health watchdog (opt-in).
+.TP
+.I ~/.config/socksy/
+Config, saved profiles, and state.
+.SH EXAMPLES
+.PP
+Apply an authenticated proxy:
+.PP
+.RS
+.EX
+socksy set 'user123:secret@eu.example.net:1080'
+.EE
+.RE
+.PP
+Geo-targeted, sticky exit:
+.PP
+.RS
+.EX
+socksy set --country GR --sticky 'user123:secret@eu.example.net:1080'
+.EE
+.RE
+.PP
+Turn on the health watchdog:
+.PP
+.RS
+.EX
+socksy watchdog on
+.EE
+.RE
+.SH SECURITY
+Proxy credentials are stored in plain text in the systemd unit and the profiles
+file, both written with mode
+.BR 600 .
+socksy never sends your credentials anywhere except to the upstream proxy you
+specify.
+.SH SEE ALSO
+.BR gsettings (1),
+.BR systemctl (1),
+.BR curl (1)
+.PP
+Project homepage: https://github.com/Nrentzilas/socksy
+.SH LICENSE
+MIT.

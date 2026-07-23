@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / usage help
+    url: https://github.com/Nrentzilas/socksy/discussions
+    about: Ask how to use socksy, or share a setup. For bugs and features, use the templates.

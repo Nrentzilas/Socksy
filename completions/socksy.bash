@@ -1,0 +1,36 @@
+# bash completion for socksy
+_socksy() {
+  local cur prev words cword
+  _init_completion 2>/dev/null || {
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cword=$COMP_CWORD
+  }
+
+  local cmds="set on off status test watch watchdog dns bypass save use list rm --version --help"
+
+  if [ "$cword" -eq 1 ]; then
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+    return
+  fi
+
+  local sub="${COMP_WORDS[1]}"
+  case "$sub" in
+    dns)
+      COMPREPLY=( $(compgen -W "on off status" -- "$cur") ) ;;
+    watchdog)
+      COMPREPLY=( $(compgen -W "on off status" -- "$cur") ) ;;
+    bypass)
+      COMPREPLY=( $(compgen -W "list add rm reset" -- "$cur") ) ;;
+    status)
+      COMPREPLY=( $(compgen -W "--json" -- "$cur") ) ;;
+    use|rm)
+      # complete saved profile names
+      local names; names="$(socksy profiles 2>/dev/null)"
+      COMPREPLY=( $(compgen -W "$names" -- "$cur") ) ;;
+    set)
+      COMPREPLY=( $(compgen -W "--type --country --sticky --session" -- "$cur") ) ;;
+    *) COMPREPLY=() ;;
+  esac
+}
+complete -F _socksy socksy
