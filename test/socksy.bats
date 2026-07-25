@@ -90,6 +90,24 @@ setup() {
   [ "$(json_esc 'a"b')" = 'a\"b' ]
 }
 
+@test "detect_backend maps desktops to backends" {
+  [ "$(XDG_CURRENT_DESKTOP=GNOME      DESKTOP_SESSION='' detect_backend)" = gnome ]
+  [ "$(XDG_CURRENT_DESKTOP=KDE        DESKTOP_SESSION='' detect_backend)" = kde ]
+  [ "$(XDG_CURRENT_DESKTOP=plasma     DESKTOP_SESSION='' detect_backend)" = kde ]
+  [ "$(XDG_CURRENT_DESKTOP=X-Cinnamon DESKTOP_SESSION='' detect_backend)" = gnome ]
+}
+
+@test "env backend writes a sourceable on/off file" {
+  local d; d="$(mktemp -d)"
+  CONF_DIR="$d"; ENV_FILE="$d/env.sh"; LOCAL_PORT=1081; IGNORE_HOSTS="localhost"
+  _env_write on
+  _env_is_on
+  grep -q 'socks5h://127.0.0.1:1081' "$ENV_FILE"
+  _env_write off
+  ! _env_is_on
+  rm -rf "$d"
+}
+
 @test "parse_proxy rejects a non-numeric port" {
   run parse_proxy 'host:notaport'
   [ "$status" -ne 0 ]

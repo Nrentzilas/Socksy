@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 #
-# socksy makes it easy to run an authenticated SOCKS5 proxy on GNOME.
+# socksy makes it easy to run an authenticated SOCKS5 proxy on Linux desktops.
 #
-# GNOME's system proxy can't send a SOCKS username/password. socksy fixes that
-# by running a tiny local relay (gost) that injects your credentials, then
-# points GNOME's system proxy at the local relay. One command, done.
+# A desktop's system proxy can't send a SOCKS username/password. socksy fixes
+# that by running a tiny local relay (gost) that injects your credentials, then
+# points the system proxy at the local relay. One command, done. Works on GNOME
+# and KDE, with a CLI-only env-file fallback for other setups.
 #
 # Homepage: https://github.com/Nrentzilas/socksy
 # License:  MIT
 #
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ---- paths ------------------------------------------------------------------
 # Absolute path to this script, for baking into systemd units (watchdog).
@@ -33,12 +34,13 @@ HEALTH_STATE="$CONF_DIR/health" # last watchdog probe result (key=value lines)
 
 # ---- config file ------------------------------------------------------------
 # Optional ~/.config/socksy/config with simple "key = value" lines. Recognised:
-#   local_port, gost_version, session_keyword, country_keyword, type, ignore_hosts
+#   local_port, gost_version, session_keyword, country_keyword, type,
+#   ignore_hosts, health_*, backend
 # Unknown keys are ignored. The file is parsed (not sourced) so it can't run code.
 # Precedence for every default below: environment variable > config file > built-in.
 cfg_local_port=""; cfg_gost_version=""; cfg_session_keyword=""
 cfg_country_keyword=""; cfg_type=""; cfg_ignore_hosts=""
-cfg_health_interval=""; cfg_health_fails=""; cfg_health_url=""
+cfg_health_interval=""; cfg_health_fails=""; cfg_health_url=""; cfg_backend=""
 load_config() {
   [ -f "$CONFIG_FILE" ] || return 0
   local line key val
@@ -65,6 +67,7 @@ load_config() {
       health_interval) cfg_health_interval="$val" ;;
       health_fails)    cfg_health_fails="$val" ;;
       health_url)      cfg_health_url="$val" ;;
+      backend)         cfg_backend="$val" ;;
       *) ;;                                   # ignore unknown keys
     esac
   done < "$CONFIG_FILE"
@@ -126,8 +129,78 @@ die()   { echo "${R}✘ error:${X} $*" >&2; exit 1; }
 # ---- helpers ----------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
-require_gnome() {
-  have gsettings || die "gsettings not found. socksy targets GNOME-based desktops."
+# ---- desktop proxy backend --------------------------------------------------
+# socksy points the desktop's system proxy at the local relay. The mechanism
+# differs per environment, so it is abstracted behind a backend:
+#   gnome  gsettings          (GNOME, Cinnamon, MATE, Budgie, Unity, Pantheon)
+#   kde    kwriteconfig -> ~/.config/kioslaverc   (KDE Plasma)
+#   env    a sourceable env file (CLI-only / other desktops)
+# Selection order: SOCKSY_BACKEND env > config 'backend' > autodetect.
+detect_backend() {
+  local d
+  d="$(printf '%s' "${XDG_CURRENT_DESKTOP:-}:${DESKTOP_SESSION:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$d" in
+    *gnome*|*unity*|*cinnamon*|*mate*|*budgie*|*pantheon*) echo gnome ;;
+    *kde*|*plasma*) echo kde ;;
+    *) if   have gsettings; then echo gnome
+       elif have kwriteconfig6 || have kwriteconfig5; then echo kde
+       else echo env; fi ;;
+  esac
+}
+BACKEND="${SOCKSY_BACKEND:-${cfg_backend:-$(detect_backend)}}"
+case "$BACKEND" in gnome|kde|env) ;; *) BACKEND="env" ;; esac
+ENV_FILE="$CONF_DIR/env.sh"   # env backend: sourceable proxy exports
+
+backend_label() {
+  case "$BACKEND" in gnome) echo GNOME ;; kde) echo KDE ;; *) echo "env file" ;; esac
+}
+
+# Ensure the selected backend's tooling is present; guide toward the env fallback.
+backend_require() {
+  case "$BACKEND" in
+    gnome) have gsettings \
+             || die "gsettings not found (GNOME backend). For a CLI-only setup, set SOCKSY_BACKEND=env." ;;
+    kde)   { have kwriteconfig6 || have kwriteconfig5; } \
+             || die "kwriteconfig not found (KDE backend). For a CLI-only setup, set SOCKSY_BACKEND=env." ;;
+    env)   : ;;
+  esac
+}
+
+# ---- KDE helpers (Plasma 6 tools first, then 5) -----------------------------
+_kwrite() { if have kwriteconfig6; then kwriteconfig6 "$@"; else kwriteconfig5 "$@"; fi; }
+_kread()  { if have kreadconfig6;  then kreadconfig6  "$@"; else kreadconfig5  "$@"; fi; }
+# Ask running KIO workers to re-read the proxy config. Best-effort.
+_kde_reparse() {
+  have dbus-send || return 0
+  dbus-send --session --type=signal /KIO/Scheduler \
+    org.kde.KIO.Scheduler.reparseSlaveConfiguration string:'' >/dev/null 2>&1 || true
+}
+
+# ---- env backend helpers ----------------------------------------------------
+_env_is_on() { grep -q '^export all_proxy=' "$ENV_FILE" 2>/dev/null; }
+_env_write() {   # $1 = on|off
+  mkdir -p "$CONF_DIR"
+  if [ "$1" = on ]; then
+    local url="socks5h://127.0.0.1:${LOCAL_PORT}" no
+    no="$(printf '%s' "$IGNORE_HOSTS" | tr -d '[:space:]')"
+    { echo "# Managed by socksy. Source this file to route your shell through the relay."
+      echo "export all_proxy=\"$url\" ALL_PROXY=\"$url\""
+      echo "export http_proxy=\"$url\" HTTP_PROXY=\"$url\""
+      echo "export https_proxy=\"$url\" HTTPS_PROXY=\"$url\""
+      echo "export no_proxy=\"$no\" NO_PROXY=\"$no\""
+    } > "$ENV_FILE"
+  else
+    { echo "# Managed by socksy. Proxy is OFF. Source this file to clear the exports."
+      echo "unset all_proxy ALL_PROXY http_proxy HTTP_PROXY https_proxy HTTPS_PROXY no_proxy NO_PROXY"
+    } > "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+# Printed after set/off for the env backend: how to actually load the exports.
+env_hint() {
+  [ "$BACKEND" = env ] || return 0
+  info "env backend: run ${B}source ${ENV_FILE}${X} in shells you want proxied,"
+  info "or add ${DIM}[ -f ${ENV_FILE} ] && . ${ENV_FILE}${X} to your ~/.bashrc once."
 }
 
 rand_token() {
@@ -291,11 +364,57 @@ EOF
   systemctl --user daemon-reload
 }
 
-point_gnome_at_relay() {
-  gsettings set org.gnome.system.proxy.socks host '127.0.0.1'
-  gsettings set org.gnome.system.proxy.socks port "$LOCAL_PORT"
-  apply_ignore_hosts
-  gsettings set org.gnome.system.proxy mode 'manual'
+# Point the desktop's system proxy at the local relay (127.0.0.1:LOCAL_PORT).
+backend_point_at_relay() {
+  case "$BACKEND" in
+    gnome)
+      gsettings set org.gnome.system.proxy.socks host '127.0.0.1'
+      gsettings set org.gnome.system.proxy.socks port "$LOCAL_PORT"
+      apply_ignore_hosts
+      gsettings set org.gnome.system.proxy mode 'manual'
+      ;;
+    kde)
+      _kwrite --file kioslaverc --group "Proxy Settings" --key ProxyType 1
+      _kwrite --file kioslaverc --group "Proxy Settings" --key socksProxy "socks://127.0.0.1 ${LOCAL_PORT}"
+      apply_ignore_hosts
+      _kde_reparse
+      ;;
+    env)
+      _env_write on
+      ;;
+  esac
+}
+
+# Turn the desktop's system proxy back to a direct connection.
+backend_off() {
+  case "$BACKEND" in
+    gnome) gsettings set org.gnome.system.proxy mode 'none' ;;
+    kde)   _kwrite --file kioslaverc --group "Proxy Settings" --key ProxyType 0; _kde_reparse ;;
+    env)   _env_write off ;;
+  esac
+}
+
+# Current proxy mode for status output (manual|none|auto).
+backend_mode() {
+  case "$BACKEND" in
+    gnome) _unquote "$(gsettings get org.gnome.system.proxy mode)" ;;
+    kde)   case "$(_kread --file kioslaverc --group "Proxy Settings" --key ProxyType 2>/dev/null)" in
+             1) echo manual ;; 2|4) echo auto ;; *) echo none ;; esac ;;
+    env)   _env_is_on && echo manual || echo none ;;
+  esac
+}
+
+# Current SOCKS endpoint for status output, as "host:port".
+backend_socks() {
+  case "$BACKEND" in
+    gnome) local h p
+           h="$(_unquote "$(gsettings get org.gnome.system.proxy.socks host)")"
+           p="$(gsettings get org.gnome.system.proxy.socks port 2>/dev/null)"; p="${p//[!0-9]/}"
+           echo "${h}:${p}" ;;
+    kde)   local v; v="$(_kread --file kioslaverc --group "Proxy Settings" --key socksProxy 2>/dev/null)"
+           v="${v#socks://}"; echo "${v// /:}" ;;
+    env)   _env_is_on && echo "127.0.0.1:${LOCAL_PORT}" || echo ":" ;;
+  esac
 }
 
 # Build a GNOME ignore-hosts array literal from the comma-separated list.
@@ -309,14 +428,22 @@ gvariant_ignore_hosts() {
   echo "[${out}]"
 }
 
+# Push the current bypass list into the active backend.
 apply_ignore_hosts() {
-  have gsettings || return 0
-  gsettings set org.gnome.system.proxy ignore-hosts "$(gvariant_ignore_hosts)"
+  case "$BACKEND" in
+    gnome) have gsettings \
+             && gsettings set org.gnome.system.proxy ignore-hosts "$(gvariant_ignore_hosts)" ;;
+    kde)   { have kwriteconfig6 || have kwriteconfig5; } \
+             && { _kwrite --file kioslaverc --group "Proxy Settings" --key NoProxyFor "$IGNORE_HOSTS"
+                  _kde_reparse; } ;;
+    env)   _env_is_on && _env_write on ;;   # re-emit only if currently on
+  esac
+  return 0
 }
 
 # ---- commands ---------------------------------------------------------------
 cmd_set() {
-  require_gnome
+  backend_require
   # flags (any order around the proxy string):
   #   --type <socks5|http|https>  --country <XX>  --sticky | --session <id>
   local proxy="" want_session="" session_id="" country="" type_flag=""
@@ -349,7 +476,7 @@ cmd_set() {
   info "upstream : ${PX_TYPE}://${PX_USER:+${PX_USER}:***@}${PX_HOST}:${PX_PORT}"
   info "relay    : 127.0.0.1:${LOCAL_PORT}"
   write_and_start_service "$PX_FWD" "${PX_HOST}:${PX_PORT}"
-  point_gnome_at_relay
+  backend_point_at_relay
 
   mkdir -p "$CONF_DIR"
   # remember the *effective* proxy (scheme + any country/session tag) so 'on' reuses it
@@ -360,6 +487,7 @@ cmd_set() {
   ok "proxy applied."
   cmd_test || warn "relay is up but the test failed. Check 'socksy status'."
   if dns_is_on; then info "DNS: remote-DNS is ${G}on${X} for Firefox (socksy dns off to change)."; fi
+  env_hint
   return 0
 }
 
@@ -370,10 +498,11 @@ cmd_on() {
 }
 
 cmd_off() {
-  require_gnome
-  gsettings set org.gnome.system.proxy mode 'none'
+  backend_require
+  backend_off
   systemctl --user disable --now "$SERVICE" >/dev/null 2>&1 || true
-  ok "proxy off. GNOME set to direct, relay stopped."
+  ok "proxy off. Desktop set to direct, relay stopped."
+  env_hint
 }
 
 _unquote()  { local s="${1:-}"; s="${s#\'}"; s="${s%\'}"; printf '%s' "$s"; }
@@ -384,25 +513,24 @@ json_esc()  {
 }
 
 cmd_status() {
-  require_gnome
-  local active enabled mode shost sport
+  backend_require
+  local active enabled mode socks shost sport
   # is-active/is-enabled print their own value but exit non-zero when inactive;
   # '|| true' swallows that, and %%\n* keeps just the first line.
   active="$(systemctl --user is-active "$SERVICE" 2>/dev/null)"  || true
   enabled="$(systemctl --user is-enabled "$SERVICE" 2>/dev/null)" || true
   active="${active%%$'\n'*}";   active="${active:-inactive}"
   enabled="${enabled%%$'\n'*}"; enabled="${enabled:-disabled}"
-  mode="$(_unquote "$(gsettings get org.gnome.system.proxy mode)")"
-  shost="$(_unquote "$(gsettings get org.gnome.system.proxy.socks host)")"
-  sport="$(gsettings get org.gnome.system.proxy.socks port 2>/dev/null)"
-  sport="${sport//[!0-9]/}"          # e.g. 'uint32 1081' -> 1081
+  mode="$(backend_mode)"
+  socks="$(backend_socks)"; shost="${socks%:*}"; sport="${socks##*:}"
 
   if [ "${1:-}" = "--json" ]; then
     local gv=""; [ -x "$GOST" ] && gv="$($GOST -V 2>/dev/null)"
     local lp=""; [ -s "$LAST" ] && lp="$(mask "$(cat "$LAST")")"
     printf '{'
     printf '"version":"%s",'       "$(json_esc "$VERSION")"
-    printf '"gnome_mode":"%s",'    "$(json_esc "$mode")"
+    printf '"backend":"%s",'       "$(json_esc "$BACKEND")"
+    printf '"proxy_mode":"%s",'    "$(json_esc "$mode")"
     printf '"socks_host":"%s",'    "$(json_esc "$shost")"
     printf '"socks_port":%s,'      "${sport:-0}"
     printf '"local_port":%s,'      "${LOCAL_PORT}"
@@ -416,14 +544,17 @@ cmd_status() {
     return 0
   fi
 
-  echo "${B}GNOME mode :${X} ${mode}"
-  echo "${B}GNOME SOCKS:${X} ${shost}:${sport}"
+  echo "${B}backend    :${X} $(backend_label)"
+  echo "${B}proxy mode :${X} ${mode}"
+  if [ -n "$shost" ]; then echo "${B}SOCKS      :${X} ${shost}:${sport}"
+  else                     echo "${B}SOCKS      :${X} (not set)"; fi
   echo "${B}relay      :${X} ${active} / ${enabled}"
   echo "${B}remote DNS :${X} $(dns_is_on && echo 'on (Firefox)' || echo 'off')"
   echo "${B}watchdog   :${X} $(watchdog_active && echo "on (every ${HEALTH_INTERVAL}s)" || echo off)"
   [ -x "$GOST" ] && echo "${B}gost       :${X} $($GOST -V 2>/dev/null)"
   echo "${B}bypass     :${X} ${IGNORE_HOSTS}"
   [ -s "$LAST" ] && echo "${B}last proxy :${X} $(mask "$(cat "$LAST")")"
+  [ "$BACKEND" = env ] && echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
 }
 
 cmd_test() {
@@ -525,14 +656,14 @@ cmd_watchdog() {
   esac
 }
 
-# Manage the GNOME no-proxy (ignore-hosts) list; persisted to the config file.
+# Manage the desktop no-proxy (bypass) list; persisted to the config file.
 _save_ignore_hosts() { _config_set ignore_hosts "$IGNORE_HOSTS"; apply_ignore_hosts; }
 
 cmd_bypass() {
   local action="${1:-list}" host new h
   case "$action" in
     list|"")
-      echo "${B}bypass (GNOME no-proxy list):${X}"
+      echo "${B}bypass ($(backend_label) no-proxy list):${X}"
       local IFS=,
       for h in $IGNORE_HOSTS; do
         h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"
@@ -563,8 +694,8 @@ cmd_bypass() {
 }
 
 # ---- remote DNS (Firefox) ---------------------------------------------------
-# CLI (socks5h) and GNOME/GIO apps already resolve DNS at the exit, and Chrome
-# does remote DNS over SOCKS5 by default. Firefox is the one that leaks unless
+# CLI tools using socks5h already resolve DNS at the exit, and Chrome does
+# remote DNS over SOCKS5 by default. Firefox is the one that leaks unless
 # network.proxy.socks_remote_dns is enabled, so that's what we manage here.
 _ff_profiles() {
   # real profile dirs (contain prefs.js or match *.default*)
@@ -609,8 +740,8 @@ cmd_dns() {
         warn "restart Firefox for it to take effect."
       fi
       echo
-      echo "${DIM}Posture: CLI (socks5h) and GNOME apps already resolve remotely;"
-      echo "Chrome does too by default. This toggle covers Firefox.${X}"
+      echo "${DIM}Posture: CLI (socks5h) resolves remotely and Chrome does too by"
+      echo "default. This toggle covers Firefox, the common local-DNS leaker.${X}"
       ;;
     off)
       mkdir -p "$CONF_DIR"; echo off > "$DNS_STATE"
@@ -622,7 +753,7 @@ cmd_dns() {
       ;;
     status|"")
       echo "${B}remote DNS (Firefox):${X} $(dns_is_on && echo on || echo off)"
-      echo "${DIM}CLI + GNOME apps + Chrome resolve DNS at the exit already.${X}"
+      echo "${DIM}CLI (socks5h) and Chrome resolve DNS at the exit already.${X}"
       ;;
     *) die "usage: socksy dns on|off|status" ;;
   esac
@@ -687,7 +818,7 @@ cmd_profiles() { [ -f "$PROFILES" ] && cut -f1 "$PROFILES" || true; }
 
 usage() {
   cat <<EOF
-${B}socksy${X} ${DIM}v${VERSION}${X}: the easy authenticated SOCKS5 proxy for GNOME.
+${B}socksy${X} ${DIM}v${VERSION}${X}: the easy authenticated SOCKS5 proxy for Linux desktops.
 
 ${B}USAGE${X}
   socksy set [--type socks5|http|https] [--country XX] [--sticky|--session <id>] 'user:pass@host:port'
@@ -700,7 +831,7 @@ ${B}USAGE${X}
   socksy watchdog on|off|status       auto-restart the relay when the exit goes bad
 
   socksy dns on|off|status            remote DNS for Firefox (stop DNS leaks)
-  socksy bypass list|add|rm|reset     manage the GNOME no-proxy (ignore-hosts) list
+  socksy bypass list|add|rm|reset     manage the no-proxy (ignore-hosts) list
 
   socksy save <name> 'user:pass@..'   remember a proxy under a name
   socksy use  [<name>]                apply a saved proxy (no name = last used)
@@ -720,7 +851,12 @@ ${B}SET FLAGS${X}
 ${B}CONFIG FILE${X} ${DIM}(${CONFIG_FILE}, optional)${X}
   ${DIM}key = value lines. Keys: local_port, gost_version, session_keyword,${X}
   ${DIM}country_keyword, type, ignore_hosts, health_interval, health_fails,${X}
-  ${DIM}health_url. Env vars still win over the file.${X}
+  ${DIM}health_url, backend. Env vars still win over the file.${X}
+
+${B}BACKEND${X} ${DIM}(current: $(backend_label))${X}
+  ${DIM}How the desktop proxy is set: gnome (gsettings), kde (kioslaverc), or${X}
+  ${DIM}env (a sourceable ${ENV_FILE}). Autodetected; override with${X}
+  ${DIM}SOCKSY_BACKEND or the 'backend' config key.${X}
 
 ${B}EXAMPLES${X}
   socksy set 'user123:secret@eu.example.net:1080'

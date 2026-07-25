@@ -1,21 +1,39 @@
 .\" Manpage for socksy.
-.TH SOCKSY 1 "2026-07-23" "socksy 0.1.0" "User Commands"
+.TH SOCKSY 1 "2026-07-23" "socksy 0.2.0" "User Commands"
 .SH NAME
-socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on GNOME
+socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on Linux desktops
 .SH SYNOPSIS
 .B socksy
 .I command
 .RI [ options ]
 .RI [ 'user:pass@host:port' ]
 .SH DESCRIPTION
-GNOME's system proxy settings cannot send a SOCKS username and password.
+A desktop's system proxy settings cannot send a SOCKS username and password.
 .B socksy
 works around this by running a small local relay
 .RB ( gost )
-that injects your credentials and forwards traffic upstream, then points GNOME's
+that injects your credentials and forwards traffic upstream, then points the
 system proxy at the local relay
 .RB ( 127.0.0.1:1081
 by default).
+.PP
+The system proxy is set through a backend chosen for your environment:
+.B gnome
+.RB ( gsettings ),
+.B kde
+.RI ( ~/.config/kioslaverc
+via
+.BR kwriteconfig ),
+or
+.B env
+(a sourceable
+.IR ~/.config/socksy/env.sh
+for CLI-only or other desktops). The backend is autodetected and can be
+overridden with
+.B SOCKSY_BACKEND
+or the
+.B backend
+config key.
 .PP
 Everything lives under
 .I ~/.local
@@ -49,11 +67,11 @@ Live exit-IP loop (default 5s); flags every change.
 Auto-restart the relay when the exit goes bad (systemd user timer).
 .TP
 .BR "dns " { on | off | status }
-Remote DNS for Firefox (stops DNS leaks). CLI, GNOME apps and Chrome already
-resolve remotely.
+Remote DNS for Firefox (stops DNS leaks). CLI tools using socks5h and Chrome
+already resolve remotely.
 .TP
 .BR "bypass " { list | add | rm | reset }
-Manage the GNOME no-proxy
+Manage the no-proxy
 .RB ( ignore-hosts )
 list.
 .TP
@@ -89,7 +107,8 @@ holds optional
 .RI ' "key = value" '
 defaults (parsed, never executed). Recognised keys:
 .BR local_port ", " gost_version ", " session_keyword ", " country_keyword ", "
-.BR type ", " ignore_hosts ", " health_interval ", " health_fails ", " health_url .
+.BR type ", " ignore_hosts ", " health_interval ", " health_fails ", " health_url ", "
+.BR backend .
 Precedence is environment variable, then config file, then built-in default.
 .SH ENVIRONMENT
 .TP
@@ -105,6 +124,11 @@ Default upstream type.
 .TP
 .B SOCKSY_HEALTH_INTERVAL ", " SOCKSY_HEALTH_FAILS ", " SOCKSY_HEALTH_URL
 Watchdog probe cadence, failure threshold, and probe URL.
+.TP
+.B SOCKSY_BACKEND
+Desktop proxy backend:
+.BR gnome ", " kde ", or " env
+(default: autodetected).
 .SH FILES
 .TP
 .I ~/.local/bin/socksy

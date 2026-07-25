@@ -80,6 +80,29 @@ chk "mask scheme noauth" "socks5://host:1080"        "$(mask 'socks5://host:1080
 IGNORE_HOSTS="localhost,127.0.0.0/8, ::1"
 chk "gvariant array" "['localhost', '127.0.0.0/8', '::1']" "$(gvariant_ignore_hosts)"
 
+# --- detect_backend maps desktops to backends ---
+chk "detect gnome"    "gnome" "$(XDG_CURRENT_DESKTOP=GNOME      DESKTOP_SESSION='' detect_backend)"
+chk "detect kde"      "kde"   "$(XDG_CURRENT_DESKTOP=KDE        DESKTOP_SESSION='' detect_backend)"
+chk "detect plasma"   "kde"   "$(XDG_CURRENT_DESKTOP=plasma     DESKTOP_SESSION='' detect_backend)"
+chk "detect cinnamon" "gnome" "$(XDG_CURRENT_DESKTOP=X-Cinnamon DESKTOP_SESSION='' detect_backend)"
+
+# --- env backend writes a sourceable on/off file ---
+# CONF_DIR/LOCAL_PORT/IGNORE_HOSTS are consumed by _env_write in the sourced
+# script, so shellcheck can't see the use; ENV_FILE is referenced below.
+_bk_tmp="$(mktemp -d)"; ENV_FILE="$_bk_tmp/env.sh"
+# shellcheck disable=SC2034
+CONF_DIR="$_bk_tmp"
+# shellcheck disable=SC2034
+LOCAL_PORT=1081
+# shellcheck disable=SC2034
+IGNORE_HOSTS="localhost,127.0.0.0/8"
+_env_write on
+chk "env on is_on"  "on"                        "$(_env_is_on && echo on || echo off)"
+chk "env on url"    "socks5h://127.0.0.1:1081"  "$(grep -o 'socks5h://127.0.0.1:1081' "$ENV_FILE" | head -1)"
+_env_write off
+chk "env off is_on" "off"                        "$(_env_is_on && echo on || echo off)"
+rm -rf "$_bk_tmp"
+
 # --- json_esc ---
 chk "json_esc quote" 'a\"b' "$(json_esc 'a"b')"
 

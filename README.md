@@ -4,10 +4,11 @@
 [![shellcheck](https://github.com/Nrentzilas/socksy/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/Nrentzilas/socksy/actions/workflows/shellcheck.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**The easy way to run an authenticated SOCKS5 proxy system-wide on GNOME.**
+**The easy way to run an authenticated SOCKS5 proxy system-wide on Linux desktops.**
 
-Paste one proxy string. socksy handles the credentials, wires up GNOME, and
-confirms your new exit IP, all in a single command.
+Paste one proxy string. socksy handles the credentials, wires up your desktop
+proxy, and confirms your new exit IP, all in a single command. Works on GNOME
+and KDE, with a CLI-only fallback for everything else.
 
 ![socksy demo showing install, applying an authenticated SOCKS5 proxy, and confirming the exit IP from the terminal](assets/demo.gif)
 
@@ -26,26 +27,27 @@ socksy set 'user:pass@host:port'
 
 ## Why this exists
 
-GNOME's built-in proxy settings **cannot send a SOCKS username and password**;
-there are simply no fields for it. So if your provider gives you an
-*authenticated* SOCKS5 proxy (very common for residential/mobile proxies), the
-GNOME GUI is a dead end: apps connect, then get rejected.
+Desktop proxy settings **cannot send a SOCKS username and password**; there are
+simply no fields for it. So if your provider gives you an *authenticated* SOCKS5
+proxy (very common for residential/mobile proxies), the system proxy GUI is a
+dead end: apps connect, then get rejected.
 
 socksy solves this the clean way:
 
 ```
-  GNOME apps ──▶ 127.0.0.1:1081 ──▶ gost relay ──▶ your.proxy:1080
+  your apps  ──▶ 127.0.0.1:1081 ──▶ gost relay ──▶ your.proxy:1080
    (no auth)      (local, no auth)   (adds creds)   (authenticated)
 ```
 
 A tiny local relay ([gost](https://github.com/go-gost/gost)) holds your
-credentials and forwards traffic upstream. GNOME just points at the local relay.
-You get system-wide, authenticated SOCKS5 with zero fuss.
+credentials and forwards traffic upstream. Your desktop just points at the local
+relay. You get system-wide, authenticated SOCKS5 with zero fuss.
 
 ## Features
 
 - **One command** to apply, one to turn off. No config files to hand-edit.
-- **Handles authentication** that GNOME can't do on its own.
+- **Handles authentication** that the desktop proxy GUI can't do on its own.
+- **GNOME, KDE, or CLI-only**: autodetects the right backend, override with `SOCKSY_BACKEND`.
 - **Auto-installs** the `gost` relay on first use, with **SHA-256 verification** (no root needed).
 - **Runs as a systemd user service**: survives logout, restarts on failure.
 - **Saved profiles**: `socksy save work '...'` then `socksy use work`.
@@ -53,7 +55,7 @@ You get system-wide, authenticated SOCKS5 with zero fuss.
 - **Country builder**: `--country GR` tags the username for a geo-targeted exit.
 - **SOCKS5 / HTTP / HTTPS upstreams**: `--type http` for proxies that aren't SOCKS.
 - **Remote DNS**: `socksy dns on` stops Firefox DNS leaks.
-- **LAN bypass**: `socksy bypass` manages the GNOME no-proxy list (localhost, `.local`, RFC1918).
+- **LAN bypass**: `socksy bypass` manages the no-proxy list (localhost, `.local`, RFC1918).
 - **Health watchdog**: `socksy watchdog on` auto-restarts the relay when the exit goes bad.
 - **Live IP watch**: `socksy watch` loops the exit IP and flags every change.
 - **Scriptable**: `socksy status --json` for status bars and automation.
@@ -65,7 +67,10 @@ You get system-wide, authenticated SOCKS5 with zero fuss.
 
 ## Requirements
 
-- A **GNOME-based** desktop (Fedora, Ubuntu GNOME, Debian GNOME, etc.); it uses `gsettings`.
+- A Linux desktop. socksy autodetects a backend:
+  - **GNOME** and relatives (Cinnamon, MATE, Budgie, Unity, Pantheon), via `gsettings`.
+  - **KDE Plasma**, via `kwriteconfig` writing `~/.config/kioslaverc`.
+  - Anything else, including **headless/CLI-only**, via a sourceable `~/.config/socksy/env.sh`.
 - `systemd` user services (standard on modern Linux).
 - `curl` (to auto-download gost) and `bash`.
 
@@ -95,7 +100,7 @@ socksy watch [seconds]              # live exit-IP loop (default 5s; flags chang
 socksy watchdog on|off|status       # auto-restart the relay when the exit goes bad
 
 socksy dns on|off|status            # remote DNS for Firefox (see below)
-socksy bypass list|add|rm|reset     # manage the GNOME no-proxy (ignore-hosts) list
+socksy bypass list|add|rm|reset     # manage the no-proxy (ignore-hosts) list
 
 socksy save <name> 'user:pass@..'   # remember a proxy under a name
 socksy use  [<name>]                # apply a saved proxy (no name = last used)
@@ -120,6 +125,7 @@ ignore_hosts    = localhost,127.0.0.0/8,::1,*.local,10.0.0.0/8,172.16.0.0/12,192
 health_interval = 30              # watchdog: probe the exit every N seconds
 health_fails    = 2               # restart the relay after N consecutive failures
 health_url      = https://api.ipify.org
+backend         = gnome           # desktop proxy backend: gnome | kde | env (default: autodetect)
 ```
 
 Precedence is **environment variable → config file → built-in default**, so an
@@ -160,14 +166,16 @@ export SOCKSY_SESSION_KEYWORD='-sessid-'
 
 ### Browsers & DNS
 
-Point Firefox/Chrome at **"Use system proxy settings"** to follow socksy.
+Point Firefox/Chrome at **"Use system proxy settings"** to follow socksy on
+GNOME or KDE. With the `env` backend there is no system proxy, so start browsers
+from a shell that has sourced `~/.config/socksy/env.sh`.
 
 DNS posture with the relay:
 
 | Client | DNS resolution | Leak? |
 |---|---|---|
 | CLI via `socks5h://` | at the exit (remote) | no |
-| GNOME / GIO apps | hostname passed to SOCKS | no |
+| System-proxy apps (GNOME/KDE) | hostname passed to SOCKS | no |
 | Chrome + SOCKS5 | remote by default | no |
 | **Firefox** | **local, unless configured** | **yes** |
 
@@ -185,6 +193,7 @@ already resolves at the exit.
 | watchdog timer (opt-in) | `~/.config/systemd/user/socksy-watchdog.{service,timer}` |
 | saved profiles | `~/.config/socksy/profiles` (chmod `600`) |
 | optional config | `~/.config/socksy/config` |
+| env-backend exports | `~/.config/socksy/env.sh` (chmod `600`, `env` backend only) |
 | local relay listener | `127.0.0.1:1081` |
 
 ## Security notes
@@ -205,9 +214,12 @@ already resolves at the exit.
 
 ## Roadmap
 
+Done recently:
+
+- [x] KDE and non-GNOME backends (autodetected; `env`-file fallback for CLI-only)
+
 Still ahead:
 
-- [ ] KDE / non-GNOME backends
 - [ ] GUI / tray applet
 - [ ] Packaging: `.rpm` / `.deb`
 
