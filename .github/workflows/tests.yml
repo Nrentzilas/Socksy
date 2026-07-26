@@ -15,6 +15,7 @@ jobs:
           bash -n bin/socksy
           bash -n completions/socksy.bash
           bash -n install.sh uninstall.sh
+          bash -n scripts/build-release.sh scripts/demo.sh
       - name: Unit tests (no dependencies)
         run: bash test/run.sh
       - name: Unit tests (bats, if available)

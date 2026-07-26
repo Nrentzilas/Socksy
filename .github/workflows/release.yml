@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write        # needed to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: bash test/run.sh
+
+      # Fails the release if the tag and the VERSION in bin/socksy disagree, so
+      # a published tarball can never contain a binary claiming another version.
+      - name: Build artifacts
+        run: scripts/build-release.sh --check "$GITHUB_REF_NAME"
+
+      - name: Verify checksum
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      # Prove the published tarball actually installs, rather than trusting that
+      # it was assembled correctly.
+      - name: Install from the tarball
+        run: |
+          tmp="$(mktemp -d)"
+          tar -xzf dist/socksy-*.tar.gz -C "$tmp"
+          cd "$tmp"/socksy-*/
+          DESTDIR="$tmp/root" ./install.sh --prefix /usr
+          test -x "$tmp/root/usr/bin/socksy"
+          test -f "$tmp/root/usr/share/man/man1/socksy.1"
+          test -f "$tmp/root/usr/share/bash-completion/completions/socksy"
+          test -f "$tmp/root/usr/share/zsh/site-functions/_socksy"
+          "$tmp/root/usr/bin/socksy" --version
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              dist/socksy-*.tar.gz dist/SHA256SUMS
+            exit 0
+          fi
+          args=( "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes )
+          # A tag with a suffix (v0.3.0-rc1) is a prerelease.
+          case "$GITHUB_REF_NAME" in *-*) args+=( --prerelease ) ;; esac
+          gh release create "${args[@]}" dist/socksy-*.tar.gz dist/SHA256SUMS

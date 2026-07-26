@@ -8,6 +8,8 @@ gost
 profiles
 last
 
+dist/
+
 *.mp4
 
 ROADMAP.md
