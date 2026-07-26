@@ -120,7 +120,8 @@ socksy test                         # print the current exit IP
 socksy watch [seconds]              # live exit-IP loop (default 5s; flags changes)
 socksy watchdog on|off|status       # auto-restart the relay when the exit goes bad
 
-socksy dns on|off|status            # remote DNS for Firefox (see below)
+socksy dns on|off|reset|status      # remote DNS for Firefox (see below)
+                                    # reset removes socksy's block from user.js
 socksy bypass list|add|rm|reset     # manage the no-proxy (ignore-hosts) list
 
 socksy save <name> 'user:pass@..'   # remember a proxy under a name

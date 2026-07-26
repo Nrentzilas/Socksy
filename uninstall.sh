@@ -32,8 +32,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# turn everything off first (ignore errors if already gone)
-command -v socksy >/dev/null 2>&1 && socksy off || true
+# Turn everything off and undo the desktop changes while the command still
+# exists (ignore errors if it is already gone). 'off' hands back the no-proxy
+# list and SOCKS host, 'dns reset' strips the managed block from Firefox.
+if command -v socksy >/dev/null 2>&1; then
+  socksy off || true
+  socksy dns reset || true
+fi
 systemctl --user disable --now socksy-watchdog.timer >/dev/null 2>&1 || true
 systemctl --user disable --now socksy-relay.service >/dev/null 2>&1 || true
 

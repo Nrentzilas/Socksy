@@ -66,9 +66,15 @@ Live exit-IP loop (default 5s); flags every change.
 .BR "watchdog " { on | off | status }
 Auto-restart the relay when the exit goes bad (systemd user timer).
 .TP
-.BR "dns " { on | off | status }
+.BR "dns " { on | off | reset | status }
 Remote DNS for Firefox (stops DNS leaks). CLI tools using socks5h and Chrome
 already resolve remotely.
+.B off
+pins the pref to false;
+.B reset
+instead removes socksy's managed block from
+.I user.js
+entirely, deleting the file if socksy created it and nothing else is left.
 .TP
 .BR "bypass " { list | add | rm | reset }
 Manage the no-proxy

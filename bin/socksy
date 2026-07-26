@@ -34,6 +34,7 @@ PROFILES="$CONF_DIR/profiles"   # lines: name<TAB>[scheme://]user:pass@host:port
 LAST="$CONF_DIR/last"
 DNS_STATE="$CONF_DIR/dns"       # contains "on" or "off"
 HEALTH_STATE="$CONF_DIR/health" # last watchdog probe result (key=value lines)
+DESKTOP_SNAPSHOT="$CONF_DIR/desktop.orig"  # pre-socksy desktop proxy values
 
 # ---- config file ------------------------------------------------------------
 # Optional ~/.config/socksy/config with simple "key = value" lines. Recognised:
@@ -402,7 +403,64 @@ EOF
 }
 
 # Point the desktop's system proxy at the local relay (127.0.0.1:LOCAL_PORT).
+# Record the desktop's proxy values before socksy first overwrites them, so that
+# 'off' can put back a no-proxy list or SOCKS host the user had set themselves.
+# Values are stored verbatim, one key=value per line, and read back by a
+# dedicated reader rather than load_config, which strips the quoting that
+# gvariant needs. Taken once and cleared by restore_desktop.
+snapshot_desktop() {
+  [ -e "$DESKTOP_SNAPSHOT" ] && return 0
+  local tmp
+  mkdir -p "$CONF_DIR"
+  tmp="$(mktemp)"
+  case "$BACKEND" in
+    gnome)
+      if ! have gsettings; then rm -f "$tmp"; return 0; fi
+      {
+        printf 'ignore_hosts=%s\n' "$(gsettings get org.gnome.system.proxy ignore-hosts)"
+        printf 'socks_host=%s\n'   "$(gsettings get org.gnome.system.proxy.socks host)"
+        printf 'socks_port=%s\n'   "$(gsettings get org.gnome.system.proxy.socks port)"
+      } > "$tmp"
+      ;;
+    kde)
+      {
+        printf 'no_proxy_for=%s\n' "$(_kread --file kioslaverc --group "Proxy Settings" --key NoProxyFor 2>/dev/null)"
+        printf 'socks_proxy=%s\n'  "$(_kread --file kioslaverc --group "Proxy Settings" --key socksProxy 2>/dev/null)"
+      } > "$tmp"
+      ;;
+    env)
+      # env.sh is socksy's own file, written and removed wholesale. Nothing of
+      # the user's to preserve.
+      rm -f "$tmp"; return 0
+      ;;
+  esac
+  mv "$tmp" "$DESKTOP_SNAPSHOT"
+  chmod 600 "$DESKTOP_SNAPSHOT" 2>/dev/null || true
+  return 0
+}
+
+# Put the snapshot back and drop it, so the next 'set' takes a fresh one.
+restore_desktop() {
+  [ -f "$DESKTOP_SNAPSHOT" ] || return 0
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    key="${line%%=*}"; val="${line#*=}"
+    case "$BACKEND:$key" in
+      gnome:ignore_hosts) gsettings set org.gnome.system.proxy ignore-hosts "$val" ;;
+      gnome:socks_host)   gsettings set org.gnome.system.proxy.socks host "$val" ;;
+      gnome:socks_port)   gsettings set org.gnome.system.proxy.socks port "$val" ;;
+      kde:no_proxy_for)   _kwrite --file kioslaverc --group "Proxy Settings" --key NoProxyFor "$val" ;;
+      kde:socks_proxy)    _kwrite --file kioslaverc --group "Proxy Settings" --key socksProxy "$val" ;;
+    esac
+  done < "$DESKTOP_SNAPSHOT"
+  if [ "$BACKEND" = "kde" ]; then _kde_reparse; fi
+  rm -f "$DESKTOP_SNAPSHOT"
+  return 0
+}
+
 backend_point_at_relay() {
+  snapshot_desktop
   case "$BACKEND" in
     gnome)
       gsettings set org.gnome.system.proxy.socks host '127.0.0.1'
@@ -429,6 +487,10 @@ backend_off() {
     kde)   _kwrite --file kioslaverc --group "Proxy Settings" --key ProxyType 0; _kde_reparse ;;
     env)   _env_write off ;;
   esac
+  # Hand back the no-proxy list and SOCKS host we overwrote. The mode stays
+  # 'none': 'off' means a direct connection, so a proxy the user had configured
+  # before is deliberately not re-enabled, only its values are preserved.
+  restore_desktop
 }
 
 # Current proxy mode for status output (manual|none|auto).
@@ -778,6 +840,28 @@ _ff_write_pref() {
   echo "$n"
 }
 
+# Strip socksy's managed block and leave Firefox on its own default. A user.js
+# that socksy created and that is now empty is removed outright, so uninstalling
+# leaves no trace in a Firefox profile.
+_ff_remove_block() {
+  local d userjs n=0
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    userjs="$d/user.js"
+    [ -f "$userjs" ] || continue
+    grep -qF "$FF_MARK_BEGIN" "$userjs" 2>/dev/null || continue
+    sed -i "\#${FF_MARK_BEGIN}#,\#${FF_MARK_END}#d" "$userjs" 2>/dev/null || true
+    if [ -z "$(tr -d '[:space:]' < "$userjs" 2>/dev/null)" ]; then
+      rm -f "$userjs"
+      info "removed empty $(basename "$d")/user.js"
+    else
+      info "cleaned socksy block from $(basename "$d")/user.js"
+    fi
+    n=$((n+1))
+  done < <(_ff_profiles)
+  echo "$n"
+}
+
 cmd_dns() {
   case "${1:-}" in
     on)
@@ -802,11 +886,21 @@ cmd_dns() {
         warn "restart Firefox for it to take effect."
       fi
       ;;
+    reset)
+      # Remove socksy's footprint entirely rather than pinning the pref to false.
+      if [ -d "$FF_DIR" ]; then
+        local n; n="$(_ff_remove_block | tail -1)"
+        [ "${n:-0}" -gt 0 ] && ok "removed socksy's DNS block from ${n} Firefox profile(s)." \
+                            || info "no socksy DNS block found in Firefox."
+        warn "restart Firefox for it to take effect."
+      fi
+      rm -f "$DNS_STATE"
+      ;;
     status|"")
       echo "${B}remote DNS (Firefox):${X} $(dns_is_on && echo on || echo off)"
       echo "${DIM}CLI (socks5h) and Chrome resolve DNS at the exit already.${X}"
       ;;
-    *) die "usage: socksy dns on|off|status" ;;
+    *) die "usage: socksy dns on|off|reset|status" ;;
   esac
 }
 
@@ -881,7 +975,7 @@ ${B}USAGE${X}
   socksy watch [seconds]              live exit-IP loop (default 5s; flags changes)
   socksy watchdog on|off|status       auto-restart the relay when the exit goes bad
 
-  socksy dns on|off|status            remote DNS for Firefox (stop DNS leaks)
+  socksy dns on|off|reset|status      remote DNS for Firefox (stop DNS leaks)
   socksy bypass list|add|rm|reset     manage the no-proxy (ignore-hosts) list
 
   socksy save <name> 'user:pass@..'   remember a proxy under a name
