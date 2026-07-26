@@ -520,7 +520,7 @@ cmd_set() {
   printf '%s\n' "$(effective_proxy_string)" > "$LAST"
   chmod 600 "$LAST" 2>/dev/null || true
 
-  sleep 1
+  wait_for_relay || warn "relay did not start listening on 127.0.0.1:${LOCAL_PORT} in time."
   ok "proxy applied."
   cmd_test || warn "relay is up but the test failed. Check 'socksy status'."
   if dns_is_on; then info "DNS: remote-DNS is ${G}on${X} for Firefox (socksy dns off to change)."; fi
@@ -593,6 +593,19 @@ cmd_status() {
   echo "${B}bypass     :${X} ${IGNORE_HOSTS}"
   [ -s "$LAST" ] && echo "${B}last proxy :${X} $(mask "$(cat "$LAST")")"
   [ "$BACKEND" = env ] && echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
+}
+
+# Block until the relay accepts TCP on its port, or give up after ~6s.
+# systemd returns from 'start' as soon as it has forked gost, but gost needs a
+# moment more to bind. A fixed sleep raced with that (measured: 1.3s to bind
+# against a 1s sleep), so 'set' would report a working proxy as broken.
+wait_for_relay() {
+  local tries=60 i
+  for ((i = 0; i < tries; i++)); do
+    if (: <>"/dev/tcp/127.0.0.1/${LOCAL_PORT}") 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  return 1
 }
 
 cmd_test() {
