@@ -71,6 +71,10 @@ relay. You get system-wide, authenticated SOCKS5 with zero fuss.
   - **GNOME** and relatives (Cinnamon, MATE, Budgie, Unity, Pantheon), via `gsettings`.
   - **KDE Plasma**, via `kwriteconfig` writing `~/.config/kioslaverc`.
   - Anything else, including **headless/CLI-only**, via a sourceable `~/.config/socksy/env.sh`.
+
+  > The KDE backend has not yet been exercised on a real Plasma session. If you run
+  > KDE, reports either way are welcome in the issue tracker.
+
 - `systemd` user services (standard on modern Linux).
 - `curl` (to auto-download gost) and `bash`.
 
@@ -84,6 +88,23 @@ cd socksy
 
 That copies `socksy` into `~/.local/bin` and ensures it's on your `PATH`.
 Restart your shell (or `source ~/.bashrc`) if the command isn't found yet.
+
+To install somewhere else, pass `--prefix`:
+
+```bash
+./install.sh --prefix /usr/local     # system-wide (needs write access)
+./install.sh --no-path               # never touch ~/.bashrc or ~/.zshrc
+```
+
+Uninstalling mirrors it: `./uninstall.sh [--prefix DIR] [--purge]`.
+
+### The relay binary
+
+socksy needs [gost](https://github.com/go-gost/gost) for the local relay. If a
+`gost` is already on your `PATH`, socksy uses it. Otherwise it downloads a
+checksum-verified copy to `~/.local/bin/gost` on first use, no root required.
+Set `SOCKSY_GOST=/path/to/gost` or the `gost_path` config key to pin a specific
+binary.
 
 ## Usage
 
@@ -118,6 +139,7 @@ parsed, never executed). Recognised keys:
 ```ini
 local_port      = 1081
 gost_version    = v3.2.6
+gost_path       = /usr/bin/gost   # use an existing gost instead of downloading one
 type            = socks5          # default upstream type: socks5 | http | https
 session_keyword = -session-       # your provider's sticky-session keyword
 country_keyword = -country-       # your provider's country keyword

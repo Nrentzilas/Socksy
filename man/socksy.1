@@ -106,9 +106,9 @@ Reuse a specific session tag (same id = same IP window).
 holds optional
 .RI ' "key = value" '
 defaults (parsed, never executed). Recognised keys:
-.BR local_port ", " gost_version ", " session_keyword ", " country_keyword ", "
-.BR type ", " ignore_hosts ", " health_interval ", " health_fails ", " health_url ", "
-.BR backend .
+.BR local_port ", " gost_version ", " gost_path ", " session_keyword ", "
+.BR country_keyword ", " type ", " ignore_hosts ", " health_interval ", "
+.BR health_fails ", " health_url ", " backend .
 Precedence is environment variable, then config file, then built-in default.
 .SH ENVIRONMENT
 .TP
@@ -129,13 +129,24 @@ Watchdog probe cadence, failure threshold, and probe URL.
 Desktop proxy backend:
 .BR gnome ", " kde ", or " env
 (default: autodetected).
+.TP
+.B SOCKSY_GOST
+Absolute path to the
+.B gost
+binary to use, instead of letting socksy find or download one.
 .SH FILES
 .TP
 .I ~/.local/bin/socksy
-The command.
+The command, for a rootless install.
+.I /usr/bin/socksy
+when installed from a distro package.
 .TP
 .I ~/.local/bin/gost
-The relay binary.
+The relay binary, when socksy downloaded it. A
+.B gost
+already present on
+.B PATH
+(for example from a distro package) is used instead.
 .TP
 .I ~/.config/systemd/user/socksy-relay.service
 The relay service.

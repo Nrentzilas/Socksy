@@ -18,7 +18,10 @@ VERSION="0.2.0"
 # Absolute path to this script, for baking into systemd units (watchdog).
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
 BIN_DIR="$HOME/.local/bin"
-GOST="$BIN_DIR/gost"
+# Where a self-downloaded gost lands. The gost actually used is resolved later by
+# resolve_gost(), which can also pick up a system-wide copy (see below).
+GOST_DOWNLOAD="$BIN_DIR/gost"
+GOST="$GOST_DOWNLOAD"
 SERVICE="socksy-relay.service"
 UNIT="$HOME/.config/systemd/user/$SERVICE"
 WD_SERVICE="socksy-watchdog.service"
@@ -34,13 +37,14 @@ HEALTH_STATE="$CONF_DIR/health" # last watchdog probe result (key=value lines)
 
 # ---- config file ------------------------------------------------------------
 # Optional ~/.config/socksy/config with simple "key = value" lines. Recognised:
-#   local_port, gost_version, session_keyword, country_keyword, type,
+#   local_port, gost_version, gost_path, session_keyword, country_keyword, type,
 #   ignore_hosts, health_*, backend
 # Unknown keys are ignored. The file is parsed (not sourced) so it can't run code.
 # Precedence for every default below: environment variable > config file > built-in.
 cfg_local_port=""; cfg_gost_version=""; cfg_session_keyword=""
 cfg_country_keyword=""; cfg_type=""; cfg_ignore_hosts=""
 cfg_health_interval=""; cfg_health_fails=""; cfg_health_url=""; cfg_backend=""
+cfg_gost_path=""
 load_config() {
   [ -f "$CONFIG_FILE" ] || return 0
   local line key val
@@ -68,6 +72,7 @@ load_config() {
       health_fails)    cfg_health_fails="$val" ;;
       health_url)      cfg_health_url="$val" ;;
       backend)         cfg_backend="$val" ;;
+      gost_path)       cfg_gost_path="$val" ;;
       *) ;;                                   # ignore unknown keys
     esac
   done < "$CONFIG_FILE"
@@ -128,6 +133,28 @@ die()   { echo "${R}✘ error:${X} $*" >&2; exit 1; }
 
 # ---- helpers ----------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Decide which gost binary to use, in this order:
+#   1. $SOCKSY_GOST                  explicit override
+#   2. gost_path config key          explicit override
+#   3. ~/.local/bin/gost             a copy socksy downloaded earlier
+#   4. gost on PATH                  system-wide install (distro package)
+#   5. ~/.local/bin/gost             download target, created by ensure_gost()
+# Checking the self-downloaded copy before PATH keeps behaviour identical for
+# existing users while letting a packaged socksy use a system gost. The result is
+# always an absolute path, because it gets baked into a systemd unit.
+resolve_gost() {
+  local found
+  if [ -n "${SOCKSY_GOST:-}" ]; then GOST="$SOCKSY_GOST"; return 0; fi
+  if [ -n "$cfg_gost_path" ]; then GOST="$cfg_gost_path"; return 0; fi
+  if [ -x "$GOST_DOWNLOAD" ]; then GOST="$GOST_DOWNLOAD"; return 0; fi
+  if found="$(command -v gost 2>/dev/null)" && [ -n "$found" ]; then
+    GOST="$(readlink -f "$found" 2>/dev/null || echo "$found")"
+    return 0
+  fi
+  GOST="$GOST_DOWNLOAD"
+}
+resolve_gost
 
 # ---- desktop proxy backend --------------------------------------------------
 # socksy points the desktop's system proxy at the local relay. The mechanism
@@ -214,13 +241,22 @@ rand_token() {
 # Download gost if we don't have it, verifying its SHA-256. No root needed.
 ensure_gost() {
   [ -x "$GOST" ] && return 0
-  info "gost not found, installing ${GOST_VERSION} to ${GOST} ..."
+  # An explicit override that does not exist is a configuration error, not a cue
+  # to download over it.
+  if [ -n "${SOCKSY_GOST:-}" ]; then
+    die "SOCKSY_GOST points at '$GOST', which is not executable."
+  fi
+  if [ -n "$cfg_gost_path" ]; then
+    die "config key gost_path points at '$GOST', which is not executable."
+  fi
+  info "gost not found, installing ${GOST_VERSION} to ${GOST_DOWNLOAD} ..."
   local arch want tarball url tmp got
   case "$(uname -m)" in
     x86_64|amd64)  arch="amd64"; want="$gost_sha_amd64" ;;
     aarch64|arm64) arch="arm64"; want="$gost_sha_arm64" ;;
     armv7l)        arch="armv7"; want="$gost_sha_armv7" ;;
-    *) die "unsupported CPU arch '$(uname -m)'. Install gost manually into $GOST." ;;
+    *) die "unsupported CPU arch '$(uname -m)'. Install gost manually into $GOST_DOWNLOAD,
+or point socksy at an existing binary with SOCKSY_GOST=/path/to/gost." ;;
   esac
   tarball="gost_${GOST_VERSION#v}_linux_${arch}.tar.gz"
   url="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/${tarball}"
@@ -237,7 +273,8 @@ Refusing to install a tampered/unknown binary."
   ok "checksum verified ($arch)"
   tar -xzf "$tmp/g.tar.gz" -C "$tmp" gost || die "could not extract gost from archive."
   mkdir -p "$BIN_DIR"
-  install -m 755 "$tmp/gost" "$GOST"
+  install -m 755 "$tmp/gost" "$GOST_DOWNLOAD"
+  GOST="$GOST_DOWNLOAD"
   rm -rf "$tmp"
   ok "installed $($GOST -V)"
 }
@@ -539,6 +576,7 @@ cmd_status() {
     printf '"remote_dns":"%s",'    "$(dns_is_on && echo on || echo off)"
     printf '"watchdog":"%s",'      "$(watchdog_active && echo active || echo inactive)"
     printf '"gost_version":"%s",'  "$(json_esc "$gv")"
+    printf '"gost_path":"%s",'     "$(json_esc "$GOST")"
     printf '"last_proxy":"%s"'     "$(json_esc "$lp")"
     printf '}\n'
     return 0
@@ -551,7 +589,7 @@ cmd_status() {
   echo "${B}relay      :${X} ${active} / ${enabled}"
   echo "${B}remote DNS :${X} $(dns_is_on && echo 'on (Firefox)' || echo 'off')"
   echo "${B}watchdog   :${X} $(watchdog_active && echo "on (every ${HEALTH_INTERVAL}s)" || echo off)"
-  [ -x "$GOST" ] && echo "${B}gost       :${X} $($GOST -V 2>/dev/null)"
+  [ -x "$GOST" ] && echo "${B}gost       :${X} $($GOST -V 2>/dev/null) ${DIM}($GOST)${X}"
   echo "${B}bypass     :${X} ${IGNORE_HOSTS}"
   [ -s "$LAST" ] && echo "${B}last proxy :${X} $(mask "$(cat "$LAST")")"
   [ "$BACKEND" = env ] && echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
@@ -849,9 +887,14 @@ ${B}SET FLAGS${X}
   ${DIM}override in ${CONFIG_FILE} or via SOCKSY_COUNTRY_KEYWORD/SOCKSY_SESSION_KEYWORD.${X}
 
 ${B}CONFIG FILE${X} ${DIM}(${CONFIG_FILE}, optional)${X}
-  ${DIM}key = value lines. Keys: local_port, gost_version, session_keyword,${X}
-  ${DIM}country_keyword, type, ignore_hosts, health_interval, health_fails,${X}
-  ${DIM}health_url, backend. Env vars still win over the file.${X}
+  ${DIM}key = value lines. Keys: local_port, gost_version, gost_path,${X}
+  ${DIM}session_keyword, country_keyword, type, ignore_hosts, health_interval,${X}
+  ${DIM}health_fails, health_url, backend. Env vars still win over the file.${X}
+
+${B}RELAY BINARY${X} ${DIM}(current: ${GOST})${X}
+  ${DIM}socksy uses a gost already on your PATH if there is one, and otherwise${X}
+  ${DIM}downloads a checksum-verified copy to ${GOST_DOWNLOAD}.${X}
+  ${DIM}Point it at a specific binary with SOCKSY_GOST or the 'gost_path' key.${X}
 
 ${B}BACKEND${X} ${DIM}(current: $(backend_label))${X}
   ${DIM}How the desktop proxy is set: gnome (gsettings), kde (kioslaverc), or${X}

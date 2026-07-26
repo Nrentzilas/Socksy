@@ -4,23 +4,46 @@
 # By default it KEEPS the downloaded gost binary and your saved profiles.
 # Pass --purge to remove those too.
 #
+# Mirrors install.sh: --prefix selects the install root that was used.
+# Per-user state (~/.config/socksy, systemd user units) is always per-user,
+# regardless of prefix, so it is removed from $HOME either way.
+#
 set -euo pipefail
 
+PREFIX="${PREFIX:-$HOME/.local}"
 PURGE=0
-[ "${1:-}" = "--purge" ] && PURGE=1
+
+usage() {
+  cat <<'EOF'
+usage: uninstall.sh [--prefix DIR] [--purge] [-h|--help]
+
+  --prefix DIR   install root to remove from (default: ~/.local)
+  --purge        also remove the gost binary and ~/.config/socksy
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --purge)   PURGE=1; shift ;;
+    --prefix)  PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
+    --prefix=*) PREFIX="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+done
 
 # turn everything off first (ignore errors if already gone)
 command -v socksy >/dev/null 2>&1 && socksy off || true
 systemctl --user disable --now socksy-watchdog.timer >/dev/null 2>&1 || true
 systemctl --user disable --now socksy-relay.service >/dev/null 2>&1 || true
 
-rm -f "$HOME/.local/bin/socksy"
+rm -f "$PREFIX/bin/socksy"
+rm -f "$PREFIX/share/bash-completion/completions/socksy"
+rm -f "$PREFIX/share/zsh/site-functions/_socksy"
+rm -f "$PREFIX/share/man/man1/socksy.1"
 rm -f "$HOME/.config/systemd/user/socksy-relay.service"
 rm -f "$HOME/.config/systemd/user/socksy-watchdog.service"
 rm -f "$HOME/.config/systemd/user/socksy-watchdog.timer"
-rm -f "$HOME/.local/share/bash-completion/completions/socksy"
-rm -f "$HOME/.local/share/zsh/site-functions/_socksy"
-rm -f "$HOME/.local/share/man/man1/socksy.1"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 echo "removed: socksy command + systemd units + completions + man page"
 

@@ -106,6 +106,41 @@ rm -rf "$_bk_tmp"
 # --- json_esc ---
 chk "json_esc quote" 'a\"b' "$(json_esc 'a"b')"
 
+# --- resolve_gost precedence ---
+# Order: SOCKSY_GOST > gost_path config > self-downloaded copy > PATH > download
+# target. The self-downloaded copy is checked before PATH so that upgrading
+# socksy never silently moves an existing user off their own gost binary.
+_g_tmp="$(mktemp -d)"
+printf '#!/bin/sh\necho fake\n' > "$_g_tmp/sysgost"; chmod 755 "$_g_tmp/sysgost"
+printf '#!/bin/sh\necho fake\n' > "$_g_tmp/mygost";  chmod 755 "$_g_tmp/mygost"
+
+GOST_DOWNLOAD="$_g_tmp/absent"; cfg_gost_path=""
+SOCKSY_GOST="$_g_tmp/sysgost" resolve_gost
+chk "gost env override" "$_g_tmp/sysgost" "$GOST"
+
+unset SOCKSY_GOST
+cfg_gost_path="$_g_tmp/sysgost"; resolve_gost
+chk "gost config key" "$_g_tmp/sysgost" "$GOST"
+
+# A self-downloaded copy wins over one merely on PATH.
+# shellcheck disable=SC2034  # read by resolve_gost in the sourced script
+cfg_gost_path=""; GOST_DOWNLOAD="$_g_tmp/mygost"
+PATH="$_g_tmp:$PATH" resolve_gost
+chk "gost download copy first" "$_g_tmp/mygost" "$GOST"
+
+# With no local copy, a gost on PATH is adopted, resolved to an absolute path.
+GOST_DOWNLOAD="$_g_tmp/absent"
+( cd "$_g_tmp" && ln -sf sysgost gost )
+PATH="$_g_tmp:$PATH" resolve_gost
+chk "gost from PATH" "$_g_tmp/sysgost" "$GOST"
+
+# Nothing anywhere: fall back to the download target so ensure_gost can fetch it.
+# shellcheck disable=SC2034  # read by resolve_gost in the sourced script
+GOST_DOWNLOAD="$_g_tmp/absent"
+PATH="/nonexistent-dir-for-test" resolve_gost
+chk "gost download fallback" "$_g_tmp/absent" "$GOST"
+rm -rf "$_g_tmp"
+
 # --- bad port must error ---
 ( parse_proxy 'host:notaport' ) 2>/dev/null \
   && { echo "FAIL bad-port did not error"; fail=$((fail+1)); } \
