@@ -11,7 +11,7 @@ _socksy() {
     'test:print the current exit IP'
     'watch:live exit-IP loop'
     'watchdog:auto-restart the relay when the exit goes bad'
-    'dns:remote DNS for Firefox (on|off|status)'
+    'dns:remote DNS for Firefox (on|off|reset|status)'
     'bypass:manage the GNOME no-proxy list'
     'save:remember a proxy under a name'
     'use:apply a saved proxy (or last)'
@@ -26,7 +26,7 @@ _socksy() {
 
   case "${words[2]}" in
     dns)
-      _values 'dns action' on off status ;;
+      _values 'dns action' on off reset status ;;
     watchdog)
       _values 'watchdog action' on off status ;;
     bypass)

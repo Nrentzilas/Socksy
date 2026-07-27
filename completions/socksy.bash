@@ -17,7 +17,7 @@ _socksy() {
   local sub="${COMP_WORDS[1]}"
   case "$sub" in
     dns)
-      COMPREPLY=( $(compgen -W "on off status" -- "$cur") ) ;;
+      COMPREPLY=( $(compgen -W "on off reset status" -- "$cur") ) ;;
     watchdog)
       COMPREPLY=( $(compgen -W "on off status" -- "$cur") ) ;;
     bypass)

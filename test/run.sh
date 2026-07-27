@@ -106,6 +106,105 @@ rm -rf "$_bk_tmp"
 # --- json_esc ---
 chk "json_esc quote" 'a\"b' "$(json_esc 'a"b')"
 
+# --- resolve_gost precedence ---
+# Order: SOCKSY_GOST > gost_path config > self-downloaded copy > PATH > download
+# target. The self-downloaded copy is checked before PATH so that upgrading
+# socksy never silently moves an existing user off their own gost binary.
+_g_tmp="$(mktemp -d)"
+printf '#!/bin/sh\necho fake\n' > "$_g_tmp/sysgost"; chmod 755 "$_g_tmp/sysgost"
+printf '#!/bin/sh\necho fake\n' > "$_g_tmp/mygost";  chmod 755 "$_g_tmp/mygost"
+
+GOST_DOWNLOAD="$_g_tmp/absent"; cfg_gost_path=""
+SOCKSY_GOST="$_g_tmp/sysgost" resolve_gost
+chk "gost env override" "$_g_tmp/sysgost" "$GOST"
+
+unset SOCKSY_GOST
+cfg_gost_path="$_g_tmp/sysgost"; resolve_gost
+chk "gost config key" "$_g_tmp/sysgost" "$GOST"
+
+# A self-downloaded copy wins over one merely on PATH.
+# shellcheck disable=SC2034  # read by resolve_gost in the sourced script
+cfg_gost_path=""; GOST_DOWNLOAD="$_g_tmp/mygost"
+PATH="$_g_tmp:$PATH" resolve_gost
+chk "gost download copy first" "$_g_tmp/mygost" "$GOST"
+
+# With no local copy, a gost on PATH is adopted, resolved to an absolute path.
+GOST_DOWNLOAD="$_g_tmp/absent"
+( cd "$_g_tmp" && ln -sf sysgost gost )
+PATH="$_g_tmp:$PATH" resolve_gost
+chk "gost from PATH" "$_g_tmp/sysgost" "$GOST"
+
+# Nothing anywhere: fall back to the download target so ensure_gost can fetch it.
+# shellcheck disable=SC2034  # read by resolve_gost in the sourced script
+GOST_DOWNLOAD="$_g_tmp/absent"
+PATH="/nonexistent-dir-for-test" resolve_gost
+chk "gost download fallback" "$_g_tmp/absent" "$GOST"
+rm -rf "$_g_tmp"
+
+# --- _ff_remove_block: strip socksy's block, delete a file it created ---
+_ff_tmp="$(mktemp -d)"
+# shellcheck disable=SC2034  # read by _ff_profiles in the sourced script
+FF_DIR="$_ff_tmp"
+mkdir -p "$_ff_tmp/aaa.default" "$_ff_tmp/bbb.default-release"
+# a user.js socksy created: nothing but the managed block
+{ echo "$FF_MARK_BEGIN"
+  echo 'user_pref("network.proxy.socks_remote_dns", true);'
+  echo "$FF_MARK_END"; } > "$_ff_tmp/aaa.default/user.js"
+# a user.js the user already had: our block plus their own prefs
+{ echo 'user_pref("browser.startup.homepage", "about:blank");'
+  echo "$FF_MARK_BEGIN"
+  echo 'user_pref("network.proxy.socks_remote_dns", true);'
+  echo "$FF_MARK_END"
+  echo 'user_pref("general.smoothScroll", false);'; } > "$_ff_tmp/bbb.default-release/user.js"
+
+_ff_remove_block >/dev/null 2>&1
+chk "ff removes socksy-only user.js" "gone" \
+  "$([ -f "$_ff_tmp/aaa.default/user.js" ] && echo present || echo gone)"
+chk "ff keeps user's own user.js" "present" \
+  "$([ -f "$_ff_tmp/bbb.default-release/user.js" ] && echo present || echo gone)"
+# grep -c prints its own 0 and exits non-zero, so swallow the status, don't add
+# a fallback echo (that would print 0 twice).
+chk "ff block stripped" "0" \
+  "$(grep -cF "$FF_MARK_BEGIN" "$_ff_tmp/bbb.default-release/user.js" 2>/dev/null || true)"
+chk "ff user prefs preserved" "2" \
+  "$(grep -c 'user_pref' "$_ff_tmp/bbb.default-release/user.js" 2>/dev/null || true)"
+rm -rf "$_ff_tmp"
+
+# --- snapshot_desktop / restore_desktop ---
+_ds_tmp="$(mktemp -d)"
+# shellcheck disable=SC2034  # read by snapshot_desktop in the sourced script
+CONF_DIR="$_ds_tmp"
+DESKTOP_SNAPSHOT="$_ds_tmp/desktop.orig"
+
+# The env backend owns its whole file, so there is nothing to snapshot.
+BACKEND="env"
+snapshot_desktop
+chk "snapshot skips env backend" "absent" \
+  "$([ -e "$DESKTOP_SNAPSHOT" ] && echo present || echo absent)"
+
+# restore_desktop is a no-op without a snapshot, and must not fail.
+restore_desktop
+chk "restore without snapshot" "0" "$?"
+
+# Stub gsettings so restore's writes can be observed without a real dconf.
+_gs_log="$_ds_tmp/gs.log"
+# shellcheck disable=SC2317,SC2329  # called indirectly, by restore_desktop
+gsettings() { printf '%s\n' "$*" >> "$_gs_log"; }
+# shellcheck disable=SC2034  # read by restore_desktop in the sourced script
+BACKEND="gnome"
+printf "ignore_hosts=['localhost', '::1']\nsocks_host=''\nsocks_port=0\n" > "$DESKTOP_SNAPSHOT"
+restore_desktop
+chk "restore writes ignore-hosts verbatim" \
+  "set org.gnome.system.proxy ignore-hosts ['localhost', '::1']" \
+  "$(grep 'ignore-hosts' "$_gs_log")"
+chk "restore writes socks host" \
+  "set org.gnome.system.proxy.socks host ''" \
+  "$(grep 'socks host' "$_gs_log")"
+chk "restore clears the snapshot" "absent" \
+  "$([ -e "$DESKTOP_SNAPSHOT" ] && echo present || echo absent)"
+unset -f gsettings
+rm -rf "$_ds_tmp"
+
 # --- bad port must error ---
 ( parse_proxy 'host:notaport' ) 2>/dev/null \
   && { echo "FAIL bad-port did not error"; fail=$((fail+1)); } \
