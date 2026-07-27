@@ -188,7 +188,7 @@ chk "restore without snapshot" "0" "$?"
 
 # Stub gsettings so restore's writes can be observed without a real dconf.
 _gs_log="$_ds_tmp/gs.log"
-# shellcheck disable=SC2317  # called indirectly, by restore_desktop
+# shellcheck disable=SC2317,SC2329  # called indirectly, by restore_desktop
 gsettings() { printf '%s\n' "$*" >> "$_gs_log"; }
 # shellcheck disable=SC2034  # read by restore_desktop in the sourced script
 BACKEND="gnome"
