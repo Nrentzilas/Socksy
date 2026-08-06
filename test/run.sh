@@ -44,6 +44,35 @@ parse_proxy 'https://u:p@h:8443'
 chk "https type" "https" "$PX_TYPE"
 chk "https fwd"  "https://u:p@h:8443" "$PX_FWD"
 
+# --- parse_proxy: the 'host:port:user:pass' form providers export ---
+parse_proxy 'host.example:1080:user:pass'
+chk "colon-form user" "user"         "$PX_USER"
+chk "colon-form pass" "pass"         "$PX_PASS"
+chk "colon-form host" "host.example" "$PX_HOST"
+chk "colon-form port" "1080"         "$PX_PORT"
+chk "colon-form fwd"  "socks5://user:pass@host.example:1080" "$PX_FWD"
+# a scheme in front still works, and a password may itself contain colons
+parse_proxy 'http://host.example:8080:user:pa:ss'
+chk "colon-form scheme" "http"  "$PX_TYPE"
+chk "colon-form pass with colon" "pa:ss" "$PX_PASS"
+# shapes that are NOT the colon form must be left alone
+chk "colon-form ignores host:port"   "host:1080" "$(normalize_colon_form 'host:1080')"
+chk "colon-form ignores non-numeric" "a:b:c:d"   "$(normalize_colon_form 'a:b:c:d')"
+chk "colon-form ignores user@host"   "u:p@h:1"   "$(normalize_colon_form 'u:p@h:1')"
+
+# --- strip_session: rotate needs a clean username before re-tagging ---
+parse_proxy 'user:pass@host:1080'
+apply_country GR >/dev/null
+apply_session old1 >/dev/null
+strip_session
+chk "strip_session drops the tag"   "user-country-GR" "$PX_USER"
+chk "strip_session keeps the rest"  "socks5://user-country-GR:pass@host:1080" "$PX_FWD"
+apply_session new2 >/dev/null
+chk "strip_session allows re-tag"   "user-country-GR-session-new2" "$PX_USER"
+parse_proxy 'user:pass@host:1080'
+strip_session
+chk "strip_session is a no-op untagged" "user" "$PX_USER"
+
 # --- effective_proxy_string always carries a scheme ---
 parse_proxy 'user:pass@host:1080'
 chk "effective socks5" "socks5://user:pass@host:1080" "$(effective_proxy_string)"
@@ -204,6 +233,34 @@ chk "restore clears the snapshot" "absent" \
   "$([ -e "$DESKTOP_SNAPSHOT" ] && echo present || echo absent)"
 unset -f gsettings
 rm -rf "$_ds_tmp"
+
+# --- cmd_run injects the proxy environment and runs the command ---
+# relay_is_active is stubbed, so this needs neither systemd nor a live relay.
+# shellcheck disable=SC2317,SC2329  # called indirectly, by cmd_run
+relay_is_active() { return 0; }
+LOCAL_PORT=1081
+# shellcheck disable=SC2034  # read by cmd_run in the sourced script
+IGNORE_HOSTS="localhost,127.0.0.0/8, ::1"
+# Read the variables back out of the child's own environment rather than through
+# a quoted 'sh -c', so the expansion belongs to env(1) and not to a nested shell.
+chk "run exports all_proxy"   "socks5h://127.0.0.1:1081" "$(cmd_run env | sed -n 's/^all_proxy=//p')"
+chk "run exports HTTPS_PROXY" "socks5h://127.0.0.1:1081" "$(cmd_run env | sed -n 's/^HTTPS_PROXY=//p')"
+chk "run trims no_proxy"      "localhost,127.0.0.0/8,::1" "$(cmd_run env | sed -n 's/^no_proxy=//p')"
+chk "run passes args verbatim" "a|b c|--flag" "$(cmd_run printf '%s|%s|%s' a 'b c' --flag)"
+# Sourcing bin/socksy turned on errexit, so a non-zero result has to be caught
+# in an AND-OR list; die() exits outright, so that case also needs a subshell.
+_rc=0; cmd_run sh -c 'exit 42' >/dev/null 2>&1 || _rc=$?
+chk "run propagates the exit code" "42" "$_rc"
+_rc=0; ( cmd_run --profile '' true ) >/dev/null 2>&1 || _rc=$?
+chk "run rejects an empty --profile" "1" "$_rc"
+
+# free_port must land above the relay's own port and be unused.
+LOCAL_PORT=49500
+_fp="$(free_port)"
+chk "free_port is above the relay port" "yes" \
+  "$({ [ -n "$_fp" ] && [ "$_fp" -gt 49500 ]; } && echo yes || echo no)"
+# shellcheck disable=SC2034  # restored for any test appended after this one
+LOCAL_PORT=1081
 
 # --- bad port must error ---
 ( parse_proxy 'host:notaport' ) 2>/dev/null \

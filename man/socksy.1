@@ -1,5 +1,5 @@
 .\" Manpage for socksy.
-.TH SOCKSY 1 "2026-07-26" "socksy 0.3.0" "User Commands"
+.TH SOCKSY 1 "2026-08-07" "socksy 0.4.0" "User Commands"
 .SH NAME
 socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on Linux desktops
 .SH SYNOPSIS
@@ -7,6 +7,16 @@ socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on Linux
 .I command
 .RI [ options ]
 .RI [ 'user:pass@host:port' ]
+.PP
+A proxy may be given as
+.IR user:pass@host:port ,
+with an explicit scheme
+.RI ( socks5://... ", " http://... ", " https://... ),
+as the
+.I host:port:user:pass
+form that most providers export, or as a bare
+.I host:port
+when no authentication is needed.
 .SH DESCRIPTION
 A desktop's system proxy settings cannot send a SOCKS username and password.
 .B socksy
@@ -52,6 +62,27 @@ Re-apply the last proxy.
 .B off
 Turn the proxy off (back to a direct connection).
 .TP
+.BI "rotate " [id]
+Re-apply the last proxy under a fresh sticky-session tag, which is how a
+rotating provider is asked for a new exit IP. Any existing session tag is
+replaced rather than stacked; the country tag, type, and credentials are kept.
+With
+.I id
+the tag is set to that value instead of a random one.
+.TP
+.BI "run [--profile " name "] " "command " [ args... ]
+Run a single command with the standard
+.IR *_proxy
+environment variables pointed at the relay, leaving the desktop's system proxy
+untouched. Without
+.B --profile
+the running relay is reused, and is started from the last proxy if none is up.
+With
+.B --profile
+a throwaway relay is started on its own port and torn down when the command
+exits, so it never disturbs a system-wide relay other applications are using.
+The command's exit status is passed through.
+.TP
 .BR "status " [ --json ]
 Show what is active. With
 .B --json
@@ -65,6 +96,11 @@ Live exit-IP loop (default 5s); flags every change.
 .TP
 .BR "watchdog " { on | off | status }
 Auto-restart the relay when the exit goes bad (systemd user timer).
+.TP
+.BI "logs [-f] [-n " lines ]
+Show the relay's journal (default 50 lines).
+.B -f
+follows it.
 .TP
 .BR "dns " { on | off | reset | status }
 Remote DNS for Firefox (stops DNS leaks). CLI tools using socks5h and Chrome
@@ -114,8 +150,26 @@ holds optional
 defaults (parsed, never executed). Recognised keys:
 .BR local_port ", " gost_version ", " gost_path ", " session_keyword ", "
 .BR country_keyword ", " type ", " ignore_hosts ", " health_interval ", "
-.BR health_fails ", " health_url ", " backend .
+.BR health_fails ", " health_url ", " backend ", " relay_creds .
 Precedence is environment variable, then config file, then built-in default.
+.TP
+.B relay_creds
+How the upstream credentials reach
+.BR gost :
+.B file
+hands it a
+.B 600
+config file,
+.B args
+passes them with
+.B -F
+on its command line, and
+.B auto
+(the default) uses
+.B file
+where the installed gost supports it. See
+.B SECURITY
+below.
 .SH ENVIRONMENT
 .TP
 .B SOCKSY_LOCAL_PORT
@@ -140,6 +194,11 @@ Desktop proxy backend:
 Absolute path to the
 .B gost
 binary to use, instead of letting socksy find or download one.
+.TP
+.B SOCKSY_RELAY_CREDS
+How credentials reach the relay:
+.BR file ", " args ", or " auto
+(default).
 .SH FILES
 .TP
 .I ~/.local/bin/socksy
@@ -159,6 +218,10 @@ The relay service.
 .TP
 .I ~/.config/systemd/user/socksy-watchdog.{service,timer}
 The health watchdog (opt-in).
+.TP
+.I ~/.config/socksy/relay.yaml
+The relay's config, holding the upstream credentials (mode
+.BR 600 ).
 .TP
 .I ~/.config/socksy/
 Config, saved profiles, and state.
@@ -187,10 +250,46 @@ Turn on the health watchdog:
 socksy watchdog on
 .EE
 .RE
+.PP
+Paste a provider's own line, then ask for a new exit IP:
+.PP
+.RS
+.EX
+socksy set 'eu.example.net:1080:user123:secret'
+socksy rotate
+.EE
+.RE
+.PP
+Proxy a single application, leaving the desktop direct:
+.PP
+.RS
+.EX
+socksy run --profile work firefox
+.EE
+.RE
 .SH SECURITY
-Proxy credentials are stored in plain text in the systemd unit and the profiles
-file, both written with mode
+Proxy credentials are stored in plain text in the relay config, the systemd
+unit, and the profiles file, all written with mode
 .BR 600 .
+.PP
+Credentials are also kept off the relay's command line. Passing them as
+.I gost -F socks5://user:pass@host:port
+would place the password in
+.IR /proc/<pid>/cmdline ,
+which is world-readable on a default Linux kernel, so any local user could read
+it out of
+.BR ps (1)
+while the relay ran, whatever the file permissions. socksy instead hands
+.B gost
+a
+.B 600
+config file.
+.B socksy status
+reports the mode in use; the
+.B relay_creds
+config key forces it either way, and a gost too old to accept a generated config
+falls back to the command line with a warning.
+.PP
 socksy never sends your credentials anywhere except to the upstream proxy you
 specify.
 .SH SEE ALSO

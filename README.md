@@ -50,14 +50,19 @@ relay. You get system-wide, authenticated SOCKS5 with zero fuss.
 - **GNOME, KDE, or CLI-only**: autodetects the right backend, override with `SOCKSY_BACKEND`.
 - **Auto-installs** the `gost` relay on first use, with **SHA-256 verification** (no root needed).
 - **Runs as a systemd user service**: survives logout, restarts on failure.
+- **Credentials stay out of `ps`**: the relay reads them from a `600` config file, not its command line.
+- **Per-app proxying**: `socksy run <cmd>` proxies one command and leaves the desktop alone.
 - **Saved profiles**: `socksy save work '...'` then `socksy use work`.
 - **Sticky sessions**: `--sticky` / `--session <id>` to hold one exit IP.
+- **One-command rotation**: `socksy rotate` grabs a fresh exit IP from the same provider.
 - **Country builder**: `--country GR` tags the username for a geo-targeted exit.
 - **SOCKS5 / HTTP / HTTPS upstreams**: `--type http` for proxies that aren't SOCKS.
+- **Takes your provider's format**: `host:port:user:pass` works anywhere a proxy is accepted.
 - **Remote DNS**: `socksy dns on` stops Firefox DNS leaks.
 - **LAN bypass**: `socksy bypass` manages the no-proxy list (localhost, `.local`, RFC1918).
 - **Health watchdog**: `socksy watchdog on` auto-restarts the relay when the exit goes bad.
 - **Live IP watch**: `socksy watch` loops the exit IP and flags every change.
+- **Readable logs**: `socksy logs -f` tails the relay's journal.
 - **Scriptable**: `socksy status --json` for status bars and automation.
 - **Optional config file**: set your own defaults in `~/.config/socksy/config`.
 - **Shell completions**: bash & zsh, including profile names.
@@ -114,11 +119,14 @@ socksy set --type http 'user:pass@host:port'   # HTTP/HTTPS upstream (default: s
 socksy set --country GR 'user:pass@host:port'  # tag the username for a GR exit
 socksy on                           # re-apply the last proxy
 socksy off                          # back to a direct connection
+socksy rotate [<id>]                # same proxy, fresh exit IP
+socksy run [--profile <n>] <cmd>    # proxy one command, leave the desktop alone
 socksy status                       # what's active right now
 socksy status --json                # machine-readable status (for scripts)
 socksy test                         # print the current exit IP
 socksy watch [seconds]              # live exit-IP loop (default 5s; flags changes)
 socksy watchdog on|off|status       # auto-restart the relay when the exit goes bad
+socksy logs [-f] [-n <lines>]       # tail the relay's journal
 
 socksy dns on|off|reset|status      # remote DNS for Firefox (see below)
                                     # reset removes socksy's block from user.js
@@ -131,6 +139,52 @@ socksy rm   <name>                  # forget a saved proxy
 ```
 
 No-auth proxies work too; just pass `host:port`.
+
+### Proxy formats
+
+Anywhere socksy takes a proxy, all of these are accepted:
+
+```bash
+socksy set 'user:pass@host:1080'          # the canonical form
+socksy set 'socks5://user:pass@host:1080' # with an explicit scheme
+socksy set 'host:1080:user:pass'          # what most providers actually export
+socksy set 'host:1080'                    # no authentication
+```
+
+The third form is the one proxy providers hand you in their dashboard, so you
+can paste a line straight from their list without rewriting it.
+
+### Proxy a single app
+
+`socksy set` is system-wide. When you only want *one* program behind the proxy,
+`socksy run` sets the standard `*_proxy` variables for that command and leaves
+your desktop on a direct connection:
+
+```bash
+socksy run curl https://api.ipify.org     # uses the relay that's already up
+socksy run --profile work firefox         # ephemeral relay, just for this app
+```
+
+Without `--profile` it reuses the running relay, starting one from your last
+proxy if none is up (again, without touching the desktop proxy). With
+`--profile` it starts a **throwaway relay on its own port**, torn down when the
+command exits, so it never disturbs a system-wide relay other apps are using.
+That means you can run two different exits side by side.
+
+The command's exit code is passed through, so `socksy run` composes in scripts.
+
+### Rotate the exit IP
+
+With a rotating provider, `socksy rotate` re-applies the current proxy under a
+fresh sticky-session tag, which is how you ask for a new exit IP:
+
+```bash
+socksy rotate            # random new session tag
+socksy rotate home2      # switch to a specific tag
+```
+
+Any existing session tag is replaced rather than stacked, and everything else
+about the proxy (country tag, type, credentials) is kept.
 
 ### Config file (optional)
 
@@ -149,6 +203,7 @@ health_interval = 30              # watchdog: probe the exit every N seconds
 health_fails    = 2               # restart the relay after N consecutive failures
 health_url      = https://api.ipify.org
 backend         = gnome           # desktop proxy backend: gnome | kde | env (default: autodetect)
+relay_creds     = auto            # how creds reach gost: auto | file | args
 ```
 
 Precedence is **environment variable → config file → built-in default**, so an
@@ -214,6 +269,7 @@ already resolves at the exit.
 | `gost` relay binary | `~/.local/bin/gost` |
 | systemd user service | `~/.config/systemd/user/socksy-relay.service` |
 | watchdog timer (opt-in) | `~/.config/systemd/user/socksy-watchdog.{service,timer}` |
+| relay config (holds credentials) | `~/.config/socksy/relay.yaml` (chmod `600`) |
 | saved profiles | `~/.config/socksy/profiles` (chmod `600`) |
 | optional config | `~/.config/socksy/config` |
 | env-backend exports | `~/.config/socksy/env.sh` (chmod `600`, `env` backend only) |
@@ -221,10 +277,25 @@ already resolves at the exit.
 
 ## Security notes
 
-- Proxy credentials are stored **in plain text** in the systemd unit and the
-  profiles file, both written with `600` permissions (only your user can read
-  them). This is standard for local proxy setups, but don't commit these files
-  or share them.
+- Proxy credentials are stored **in plain text** on disk, in the relay config,
+  the systemd unit, and the profiles file, all written with `600` permissions
+  (only your user can read them). This is standard for local proxy setups, but
+  don't commit these files or share them.
+- **Credentials are kept off the relay's command line.** Passing them as
+  `gost -F socks5://user:pass@host:port` would put the password in
+  `/proc/<pid>/cmdline`, which is world-readable on a default Linux kernel, so
+  any local user could read it out of `ps` while the relay ran, regardless of
+  the `600` files. socksy instead hands gost a `600` config file. `socksy status`
+  reports which mode is in use, and you can force it either way with
+  `relay_creds` (`auto` is the default; `file` refuses to start otherwise, `args`
+  restores the old command-line behaviour):
+
+  ```ini
+  relay_creds = file
+  ```
+
+  On a gost too old to accept a generated config, socksy falls back to the
+  command line and says so.
 - socksy never sends your credentials anywhere except to the upstream proxy you
   specify.
 
@@ -240,11 +311,15 @@ already resolves at the exit.
 Done recently:
 
 - [x] KDE and non-GNOME backends (autodetected; `env`-file fallback for CLI-only)
+- [x] Per-app proxying (`socksy run`) and one-command rotation (`socksy rotate`)
+- [x] Keep proxy credentials out of the relay's command line
 
 Still ahead:
 
 - [ ] GUI / tray applet
 - [ ] Packaging: `.rpm` / `.deb`
+- [ ] Profile pools with automatic failover in the watchdog
+- [ ] `socksy check`: a leak audit (DNS, IPv6, exit geo) in one command
 
 Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 

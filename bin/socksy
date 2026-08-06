@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # ---- paths ------------------------------------------------------------------
 # Absolute path to this script, for baking into systemd units (watchdog).
@@ -34,18 +34,20 @@ PROFILES="$CONF_DIR/profiles"   # lines: name<TAB>[scheme://]user:pass@host:port
 LAST="$CONF_DIR/last"
 DNS_STATE="$CONF_DIR/dns"       # contains "on" or "off"
 HEALTH_STATE="$CONF_DIR/health" # last watchdog probe result (key=value lines)
+RELAY_CONF="$CONF_DIR/relay.yaml"     # gost config file, so creds stay out of argv
+RELAY_MODE_STATE="$CONF_DIR/relay.mode"  # cached "<mode>\t<gost -V>" capability probe
 DESKTOP_SNAPSHOT="$CONF_DIR/desktop.orig"  # pre-socksy desktop proxy values
 
 # ---- config file ------------------------------------------------------------
 # Optional ~/.config/socksy/config with simple "key = value" lines. Recognised:
 #   local_port, gost_version, gost_path, session_keyword, country_keyword, type,
-#   ignore_hosts, health_*, backend
+#   ignore_hosts, health_*, backend, relay_creds
 # Unknown keys are ignored. The file is parsed (not sourced) so it can't run code.
 # Precedence for every default below: environment variable > config file > built-in.
 cfg_local_port=""; cfg_gost_version=""; cfg_session_keyword=""
 cfg_country_keyword=""; cfg_type=""; cfg_ignore_hosts=""
 cfg_health_interval=""; cfg_health_fails=""; cfg_health_url=""; cfg_backend=""
-cfg_gost_path=""
+cfg_gost_path=""; cfg_relay_creds=""
 load_config() {
   [ -f "$CONFIG_FILE" ] || return 0
   local line key val
@@ -74,6 +76,7 @@ load_config() {
       health_url)      cfg_health_url="$val" ;;
       backend)         cfg_backend="$val" ;;
       gost_path)       cfg_gost_path="$val" ;;
+      relay_creds)     cfg_relay_creds="$val" ;;
       *) ;;                                   # ignore unknown keys
     esac
   done < "$CONFIG_FILE"
@@ -110,6 +113,12 @@ HEALTH_INTERVAL="${SOCKSY_HEALTH_INTERVAL:-${cfg_health_interval:-30}}"
 HEALTH_FAILS="${SOCKSY_HEALTH_FAILS:-${cfg_health_fails:-2}}"
 HEALTH_URL="${SOCKSY_HEALTH_URL:-${cfg_health_url:-https://api.ipify.org}}"
 HEALTH_MAXTIME=15               # per-probe curl timeout (seconds)
+# How the upstream credentials reach gost:
+#   file  via a 600 config file        (creds stay out of /proc/<pid>/cmdline)
+#   args  via -F on the command line   (the pre-0.4 behaviour)
+#   auto  file when this gost can produce a config, otherwise args
+RELAY_CREDS="${SOCKSY_RELAY_CREDS:-${cfg_relay_creds:-auto}}"
+case "$RELAY_CREDS" in auto|file|args) ;; *) RELAY_CREDS="auto" ;; esac
 
 # SHA-256 checksums of the official gost release tarballs (from checksums.txt).
 gost_sha_amd64="b39037b0380ea001fb3c0c28441c2e10bfc694f90682739a65b53e55dce5238b"
@@ -280,7 +289,22 @@ Refusing to install a tampered/unknown binary."
   ok "installed $($GOST -V)"
 }
 
-# Parse '[scheme://]user:pass@host:port' (or 'host:port').
+# Rewrite the 'host:port:user:pass' form that most proxy providers export into
+# the canonical 'user:pass@host:port'. The shape is unambiguous: no '@', four
+# colon-separated fields, and a numeric second field. A password containing
+# colons is safe because it is the last field and keeps the remainder.
+normalize_colon_form() {
+  local raw="${1:-}" f1 f2 f3 f4
+  case "$raw" in *@*) printf '%s' "$raw"; return 0 ;; esac
+  IFS=: read -r f1 f2 f3 f4 <<< "$raw" || true
+  if [ -n "$f1" ] && [ -n "$f3" ] && [ -n "$f4" ] && [[ "$f2" =~ ^[0-9]+$ ]]; then
+    printf '%s:%s@%s:%s' "$f3" "$f4" "$f1" "$f2"
+  else
+    printf '%s' "$raw"
+  fi
+}
+
+# Parse '[scheme://]user:pass@host:port', 'host:port:user:pass', or 'host:port'.
 # Sets: PX_USER PX_PASS PX_HOST PX_PORT PX_TYPE PX_FWD
 parse_proxy() {
   local raw="${1:-}"
@@ -293,6 +317,7 @@ parse_proxy() {
                 PX_TYPE="socks5"; raw="${raw#*://}" ;;
     *://*)      raw="${raw#*://}" ;;        # unknown scheme: drop it, keep default
   esac
+  raw="$(normalize_colon_form "$raw")"
   PX_USER=""; PX_PASS=""
   local creds="" hostport
   if [[ "$raw" == *"@"* ]]; then
@@ -350,11 +375,89 @@ apply_session() {
   rebuild_fwd
 }
 
+# Drop an existing session tag, keeping everything before it. Used by 'rotate',
+# which needs a clean username before applying a fresh token.
+strip_session() {
+  [ -n "$PX_USER" ] || return 0
+  case "$PX_USER" in
+    *"$SESSION_KEYWORD"*) PX_USER="${PX_USER%%"$SESSION_KEYWORD"*}" ;;
+  esac
+  rebuild_fwd
+}
+
 dns_is_on() { [ "$(cat "$DNS_STATE" 2>/dev/null)" = "on" ]; }
 
+relay_is_active() {
+  [ "$(systemctl --user is-active "$SERVICE" 2>/dev/null || echo inactive)" = active ]
+}
+
+# ---- relay credentials ------------------------------------------------------
+# Passing '-F socks5://user:pass@host:port' on gost's command line puts the
+# password in /proc/<pid>/cmdline, which is world-readable on a default Linux
+# kernel: the 600 unit file protects the credentials at rest, but any local user
+# could read them out of 'ps' while the relay ran. Handing gost a 600 config
+# file instead keeps them out of argv entirely.
+#
+# The config is generated by gost itself (-O yaml) from the very arguments
+# socksy would otherwise pass, so its schema is whatever that gost build expects
+# rather than something socksy guesses, and the resulting relay is semantically
+# identical. Builds that cannot do that fall back to the command line.
+
+# Can this gost turn arguments into a config? Probed once per gost build and
+# cached, since the probe costs a subprocess. The probe uses dummy credentials.
+relay_creds_mode() {
+  case "$RELAY_CREDS" in args) echo args; return 0 ;; file) echo file; return 0 ;; esac
+  local ver cached mode
+  ver="$("$GOST" -V 2>/dev/null || echo unknown)"
+  if [ -f "$RELAY_MODE_STATE" ]; then
+    cached="$(head -1 "$RELAY_MODE_STATE" 2>/dev/null || true)"
+    if [ -n "$cached" ] && [ "${cached#*$'\t'}" = "$ver" ]; then
+      printf '%s\n' "${cached%%$'\t'*}"; return 0
+    fi
+  fi
+  mode="args"
+  if have timeout && timeout 5 "$GOST" -L 'socks5://127.0.0.1:0' \
+       -F 'socks5://probe:probe@probe.invalid:1080' -O yaml 2>/dev/null \
+       | grep -q 'services:'; then
+    mode="file"
+  fi
+  mkdir -p "$CONF_DIR"
+  printf '%s\t%s\n' "$mode" "$ver" > "$RELAY_MODE_STATE"
+  printf '%s\n' "$mode"
+}
+
+# Write a gost config for this upstream. Non-zero (and nothing written) if gost
+# will not produce one, so the caller can fall back to the command line.
+relay_config_write() {   # $1 = forward URL, $2 = destination path, $3 = listen port
+  local fwd="$1" dest="$2" port="$3" out host tmp
+  have timeout || return 1
+  out="$(timeout 5 "$GOST" -L "socks5://127.0.0.1:${port}" -F "$fwd" -O yaml 2>/dev/null || true)"
+  # Only trust output that really is a config for this upstream.
+  case "$out" in *services:*) ;; *) return 1 ;; esac
+  host="${fwd#*://}"; host="${host##*@}"; host="${host%:*}"
+  printf '%s' "$out" | grep -qF "$host" || return 1
+  tmp="$(mktemp)" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  printf '%s\n' "$out" > "$tmp"
+  mkdir -p "$(dirname "$dest")"
+  mv "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$dest" 2>/dev/null || true
+  return 0
+}
+
 write_and_start_service() {
-  local fwd="$1" label="$2"
+  local fwd="$1" label="$2" exec_line=""
   mkdir -p "$(dirname "$UNIT")"
+  rm -f "$RELAY_CONF"
+  if [ "$(relay_creds_mode)" = file ] && relay_config_write "$fwd" "$RELAY_CONF" "$LOCAL_PORT"; then
+    exec_line="${GOST} -C ${RELAY_CONF}"
+  else
+    if [ "$RELAY_CREDS" = file ]; then
+      die "relay_creds=file, but gost at '${GOST}' cannot generate a config file.
+Use a newer gost, or set relay_creds=args to pass credentials on the command line."
+    fi
+    exec_line="${GOST} -L socks5://127.0.0.1:${LOCAL_PORT} -F ${fwd}"
+  fi
   cat > "$UNIT" <<EOF
 [Unit]
 Description=socksy local SOCKS5 relay (${label})
@@ -362,14 +465,14 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${GOST} -L socks5://127.0.0.1:${LOCAL_PORT} -F ${fwd}
+ExecStart=${exec_line}
 Restart=on-failure
 RestartSec=3
 
 [Install]
 WantedBy=default.target
 EOF
-  chmod 600 "$UNIT"          # unit contains credentials
+  chmod 600 "$UNIT"          # unit may contain credentials (args mode)
   systemctl --user daemon-reload
   systemctl --user enable "$SERVICE" >/dev/null 2>&1 || true
   systemctl --user restart "$SERVICE"
@@ -582,7 +685,20 @@ cmd_set() {
   printf '%s\n' "$(effective_proxy_string)" > "$LAST"
   chmod 600 "$LAST" 2>/dev/null || true
 
-  wait_for_relay || warn "relay did not start listening on 127.0.0.1:${LOCAL_PORT} in time."
+  # A relay that never bound while using a config file is most likely a config
+  # this gost did not accept. Retry on the command line rather than leaving the
+  # user with a dead proxy, and remember the downgrade so it isn't retried.
+  if ! wait_for_relay; then
+    if [ -e "$RELAY_CONF" ] && [ "$RELAY_CREDS" != file ]; then
+      warn "relay did not start from its config file; retrying with command-line arguments."
+      rm -f "$RELAY_CONF"
+      RELAY_CREDS=args
+      mkdir -p "$CONF_DIR"
+      printf 'args\t%s\n' "$("$GOST" -V 2>/dev/null || echo unknown)" > "$RELAY_MODE_STATE"
+      write_and_start_service "$PX_FWD" "${PX_HOST}:${PX_PORT}"
+    fi
+    wait_for_relay || warn "relay did not start listening on 127.0.0.1:${LOCAL_PORT} in time."
+  fi
   ok "proxy applied."
   cmd_test || warn "relay is up but the test failed. Check 'socksy status'."
   if dns_is_on; then info "DNS: remote-DNS is ${G}on${X} for Firefox (socksy dns off to change)."; fi
@@ -594,6 +710,130 @@ cmd_set() {
 cmd_on() {
   [ -s "$LAST" ] || die "no previous proxy to turn on. Run: socksy set 'user:pass@host:port'"
   cmd_set "$(cat "$LAST")"
+}
+
+# Re-apply the last proxy with a fresh sticky-session tag, so a rotating
+# provider hands out a new exit IP without retyping the whole 'set' line.
+cmd_rotate() {
+  local token="${1:-}"
+  [ -s "$LAST" ] || die "no proxy to rotate. Run: socksy set 'user:pass@host:port'"
+  if [ -n "$token" ]; then
+    [[ "$token" =~ ^[A-Za-z0-9_-]+$ ]] \
+      || die "session id '${token}' must be letters, digits, '-' or '_'."
+  else
+    token="$(rand_token)"
+  fi
+  parse_proxy "$(cat "$LAST")"
+  [ -n "$PX_USER" ] || die "rotate needs an authenticated proxy (user:pass@...)."
+  strip_session                       # drop the old tag so the new one applies
+  cmd_set --session "$token" "$(effective_proxy_string)"
+}
+
+# ---- per-command proxying ---------------------------------------------------
+# 'socksy run' proxies a single command through the relay via the standard
+# *_proxy environment variables, leaving the desktop's system proxy alone.
+EPHEMERAL_PID=""
+EPHEMERAL_CONF=""
+# shellcheck disable=SC2329  # invoked from a trap, which static analysis can't see
+_kill_ephemeral() {
+  if [ -n "$EPHEMERAL_PID" ]; then kill "$EPHEMERAL_PID" 2>/dev/null || true; fi
+  if [ -n "$EPHEMERAL_CONF" ]; then rm -f "$EPHEMERAL_CONF"; fi
+  return 0
+}
+
+# First unused TCP port above the relay's, for an ephemeral relay.
+free_port() {
+  local p
+  for ((p = LOCAL_PORT + 1; p <= LOCAL_PORT + 50; p++)); do
+    (: <>"/dev/tcp/127.0.0.1/$p") 2>/dev/null || { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# gost in the background on its own port. Same credential handling as the
+# service, so 'run --profile' keeps them out of argv too.
+start_ephemeral_relay() {   # $1 = forward URL, $2 = port
+  local fwd="$1" port="$2" conf i
+  conf="$(mktemp)" || return 1
+  if [ "$(relay_creds_mode)" = file ] && relay_config_write "$fwd" "$conf" "$port"; then
+    EPHEMERAL_CONF="$conf"
+    "$GOST" -C "$conf" >/dev/null 2>&1 &
+  else
+    rm -f "$conf"
+    "$GOST" -L "socks5://127.0.0.1:${port}" -F "$fwd" >/dev/null 2>&1 &
+  fi
+  EPHEMERAL_PID=$!
+  for ((i = 0; i < 60; i++)); do
+    (: <>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && return 0
+    kill -0 "$EPHEMERAL_PID" 2>/dev/null || break   # gost already gave up
+    sleep 0.1
+  done
+  return 1
+}
+
+cmd_run() {
+  local profile=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) shift; profile="${1:-}"
+                 [ -n "$profile" ] || die "--profile needs a name, e.g. --profile work" ;;
+      --) shift; break ;;
+      -*) die "unknown flag '$1' for run." ;;
+      *)  break ;;
+    esac
+    shift
+  done
+  [ $# -gt 0 ] || die "usage: socksy run [--profile <name>] <command> [args...]"
+
+  local port="$LOCAL_PORT"
+  if [ -n "$profile" ]; then
+    # A named profile gets its own throwaway relay on its own port, so it never
+    # disturbs a system-wide relay that other apps are already using.
+    local proxy; proxy="$(profile_lookup "$profile")"
+    [ -n "$proxy" ] || die "no profile named '${profile}'. See 'socksy list'."
+    parse_proxy "$proxy"
+    ensure_gost
+    port="$(free_port)" || die "no free local port for the ephemeral relay."
+    trap _kill_ephemeral EXIT INT TERM
+    start_ephemeral_relay "$PX_FWD" "$port" \
+      || die "ephemeral relay for profile '${profile}' did not start."
+    info "relay    : 127.0.0.1:${port} ${DIM}(ephemeral, profile '${profile}')${X}"
+  elif ! relay_is_active; then
+    [ -s "$LAST" ] || die "no relay running and no saved proxy. Run: socksy set 'user:pass@host:port'"
+    info "relay not running; starting it from the last proxy (desktop proxy untouched)."
+    parse_proxy "$(cat "$LAST")"
+    ensure_gost
+    write_and_start_service "$PX_FWD" "${PX_HOST}:${PX_PORT}"
+    wait_for_relay || die "relay did not start listening on 127.0.0.1:${port}."
+  fi
+
+  local url="socks5h://127.0.0.1:${port}" no rc=0
+  no="$(printf '%s' "$IGNORE_HOSTS" | tr -d '[:space:]')"
+  env all_proxy="$url"   ALL_PROXY="$url" \
+      http_proxy="$url"  HTTP_PROXY="$url" \
+      https_proxy="$url" HTTPS_PROXY="$url" \
+      no_proxy="$no"     NO_PROXY="$no" \
+      "$@" || rc=$?
+  return "$rc"
+}
+
+# Tail the relay's journal, so debugging doesn't start with a systemctl lookup.
+cmd_logs() {
+  have journalctl || die "journalctl not found; cannot read the relay's log."
+  local follow="" lines=50
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--follow) follow=1 ;;
+      -n|--lines)  shift; lines="${1:-}"
+                   [[ "$lines" =~ ^[0-9]+$ ]] || die "-n needs a number of lines." ;;
+      "") ;;
+      *) die "usage: socksy logs [-f] [-n <lines>]" ;;
+    esac
+    shift
+  done
+  local args=( --user -u "$SERVICE" --no-pager -n "$lines" )
+  if [ -n "$follow" ]; then args+=( --follow ); fi
+  journalctl "${args[@]}"
 }
 
 cmd_off() {
@@ -622,6 +862,9 @@ cmd_status() {
   enabled="${enabled%%$'\n'*}"; enabled="${enabled:-disabled}"
   mode="$(backend_mode)"
   socks="$(backend_socks)"; shost="${socks%:*}"; sport="${socks##*:}"
+  # What the installed unit actually does, not what the config asks for.
+  local creds="args"
+  if grep -q -- ' -C ' "$UNIT" 2>/dev/null; then creds="file"; fi
 
   if [ "${1:-}" = "--json" ]; then
     local gv=""; [ -x "$GOST" ] && gv="$($GOST -V 2>/dev/null)"
@@ -639,6 +882,7 @@ cmd_status() {
     printf '"watchdog":"%s",'      "$(watchdog_active && echo active || echo inactive)"
     printf '"gost_version":"%s",'  "$(json_esc "$gv")"
     printf '"gost_path":"%s",'     "$(json_esc "$GOST")"
+    printf '"relay_creds":"%s",'   "$(json_esc "$creds")"
     printf '"last_proxy":"%s"'     "$(json_esc "$lp")"
     printf '}\n'
     return 0
@@ -652,6 +896,11 @@ cmd_status() {
   echo "${B}remote DNS :${X} $(dns_is_on && echo 'on (Firefox)' || echo 'off')"
   echo "${B}watchdog   :${X} $(watchdog_active && echo "on (every ${HEALTH_INTERVAL}s)" || echo off)"
   [ -x "$GOST" ] && echo "${B}gost       :${X} $($GOST -V 2>/dev/null) ${DIM}($GOST)${X}"
+  if [ "$creds" = file ]; then
+    echo "${B}relay creds:${X} config file ${DIM}(kept out of the process command line)${X}"
+  else
+    echo "${B}relay creds:${X} ${Y}command line${X} ${DIM}(visible in ps; see 'relay_creds' in the docs)${X}"
+  fi
   echo "${B}bypass     :${X} ${IGNORE_HOSTS}"
   [ -s "$LAST" ] && echo "${B}last proxy :${X} $(mask "$(cat "$LAST")")"
   [ "$BACKEND" = env ] && echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
@@ -927,13 +1176,21 @@ cmd_save() {
   ok "saved profile '${B}${name}${X}'. Apply it with: socksy use ${name}"
 }
 
+# Look up a saved profile's proxy string; empty if there is no such profile.
+# The '|| true' matters: under 'set -e' with pipefail, grep finding nothing
+# would otherwise abort the script before the caller could report it.
+profile_lookup() {
+  [ -f "$PROFILES" ] || return 0
+  grep -P "^${1}\t" "$PROFILES" 2>/dev/null | head -1 | cut -f2- || true
+}
+
 # use <name>  -> apply that profile;  use (no arg) -> re-apply last
 cmd_use() {
   local name="${1:-}"
   if [ -z "$name" ]; then cmd_on; return; fi
   [ -f "$PROFILES" ] || die "no saved profiles yet. Save one: socksy save <name> '...'"
   local proxy
-  proxy="$(grep -P "^${name}\t" "$PROFILES" | head -1 | cut -f2-)"
+  proxy="$(profile_lookup "$name")"
   [ -n "$proxy" ] || die "no profile named '${name}'. See 'socksy list'."
   shift || true
   cmd_set "$@" "$proxy"
@@ -970,10 +1227,13 @@ ${B}USAGE${X}
                                       apply a proxy now (auto-installs gost, auto-tests)
   socksy on                           re-apply the last proxy
   socksy off                          turn it off (back to a direct connection)
+  socksy rotate [<id>]                re-apply the last proxy with a fresh exit IP
+  socksy run [--profile <n>] <cmd>    run one command through the relay only
   socksy status [--json]              show what's active (--json for scripts)
   socksy test                         print the current exit IP
   socksy watch [seconds]              live exit-IP loop (default 5s; flags changes)
   socksy watchdog on|off|status       auto-restart the relay when the exit goes bad
+  socksy logs [-f] [-n <lines>]       show the relay's journal
 
   socksy dns on|off|reset|status      remote DNS for Firefox (stop DNS leaks)
   socksy bypass list|add|rm|reset     manage the no-proxy (ignore-hosts) list
@@ -996,7 +1256,14 @@ ${B}SET FLAGS${X}
 ${B}CONFIG FILE${X} ${DIM}(${CONFIG_FILE}, optional)${X}
   ${DIM}key = value lines. Keys: local_port, gost_version, gost_path,${X}
   ${DIM}session_keyword, country_keyword, type, ignore_hosts, health_interval,${X}
-  ${DIM}health_fails, health_url, backend. Env vars still win over the file.${X}
+  ${DIM}health_fails, health_url, backend, relay_creds.${X}
+  ${DIM}Env vars still win over the file.${X}
+
+${B}RELAY CREDENTIALS${X} ${DIM}(relay_creds = ${RELAY_CREDS})${X}
+  ${DIM}file  hand gost a 600 config file, so the password never appears in${X}
+  ${DIM}      /proc/<pid>/cmdline (i.e. in 'ps' output for any local user)${X}
+  ${DIM}args  pass it with -F on gost's command line (pre-0.4 behaviour)${X}
+  ${DIM}auto  use 'file' when gost supports it, else 'args' (the default)${X}
 
 ${B}RELAY BINARY${X} ${DIM}(current: ${GOST})${X}
   ${DIM}socksy uses a gost already on your PATH if there is one, and otherwise${X}
@@ -1013,8 +1280,12 @@ ${B}EXAMPLES${X}
   socksy set --country GR --sticky 'user123:secret@eu.example.net:1080'
   socksy set --type http 'user123:secret@eu.example.net:8080'
   socksy save work 'user123:secret@eu.example.net:1080' && socksy use work
+  socksy rotate                       # same proxy, new exit IP
+  socksy run curl https://api.ipify.org
+  socksy run --profile work firefox   # only this app is proxied
 
-${DIM}No-auth proxies work too: just pass host:port.${X}
+${DIM}No-auth proxies work too: just pass host:port. The 'host:port:user:pass'${X}
+${DIM}form that most providers export is accepted anywhere a proxy is taken.${X}
 EOF
 }
 
@@ -1028,10 +1299,13 @@ case "${1:-}" in
   set)          shift; cmd_set "$@" ;;
   on)           cmd_on ;;
   off|stop)     cmd_off ;;
+  rotate)       shift; cmd_rotate "${1:-}" ;;
+  run)          shift; cmd_run "$@" ;;
   status)       shift; cmd_status "${1:-}" ;;
   test)         cmd_test ;;
   watch)        shift; cmd_watch "${1:-}" ;;
   watchdog)     shift; cmd_watchdog "${1:-}" ;;
+  logs)         shift; cmd_logs "$@" ;;
   healthcheck)  cmd_healthcheck ;;              # internal: run by the watchdog timer
   dns)          shift; cmd_dns "${1:-}" ;;
   bypass)       shift; cmd_bypass "$@" ;;

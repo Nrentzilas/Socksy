@@ -38,8 +38,8 @@ contributing is easy.
 
 See the **Roadmap** in the [README](README.md#roadmap) and the open
 [issues](https://github.com/Nrentzilas/socksy/issues). Good first issues:
-KDE / non-GNOME backend support, `.deb`/`.rpm` packaging, or porting more of
-`test/run.sh` into additional coverage.
+`.deb`/`.rpm` packaging, profile pools with watchdog failover, a `socksy check`
+leak audit, or porting more of `test/run.sh` into additional coverage.
 
 ## Commit style
 

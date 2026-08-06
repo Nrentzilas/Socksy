@@ -49,6 +49,10 @@ rm -f "$PREFIX/share/man/man1/socksy.1"
 rm -f "$HOME/.config/systemd/user/socksy-relay.service"
 rm -f "$HOME/.config/systemd/user/socksy-watchdog.service"
 rm -f "$HOME/.config/systemd/user/socksy-watchdog.timer"
+# The relay config holds the upstream credentials and is regenerated on every
+# 'set', so it goes even without --purge; saved profiles are the user's data
+# and stay unless they ask for them to be removed.
+rm -f "$HOME/.config/socksy/relay.yaml" "$HOME/.config/socksy/relay.mode"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 echo "removed: socksy command + systemd units + completions + man page"
 

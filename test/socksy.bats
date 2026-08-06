@@ -45,6 +45,43 @@ setup() {
   [ "$PX_FWD" = "https://u:p@h:8443" ]
 }
 
+@test "parse_proxy: 'host:port:user:pass' provider form" {
+  parse_proxy 'host.example:1080:user:pass'
+  [ "$PX_USER" = user ]
+  [ "$PX_PASS" = pass ]
+  [ "$PX_HOST" = host.example ]
+  [ "$PX_PORT" = 1080 ]
+  [ "$PX_FWD" = "socks5://user:pass@host.example:1080" ]
+}
+
+@test "parse_proxy: colon form keeps a scheme and a colon-bearing password" {
+  parse_proxy 'http://host.example:8080:user:pa:ss'
+  [ "$PX_TYPE" = http ]
+  [ "$PX_PASS" = "pa:ss" ]
+}
+
+@test "normalize_colon_form leaves other shapes alone" {
+  [ "$(normalize_colon_form 'host:1080')" = 'host:1080' ]
+  [ "$(normalize_colon_form 'a:b:c:d')"   = 'a:b:c:d' ]
+  [ "$(normalize_colon_form 'u:p@h:1')"   = 'u:p@h:1' ]
+}
+
+@test "strip_session removes a session tag and allows re-tagging" {
+  parse_proxy 'user:pass@host:1080'
+  apply_country GR
+  apply_session old1
+  strip_session
+  [ "$PX_USER" = "user-country-GR" ]
+  apply_session new2
+  [ "$PX_USER" = "user-country-GR-session-new2" ]
+}
+
+@test "strip_session is a no-op on an untagged username" {
+  parse_proxy 'user:pass@host:1080'
+  strip_session
+  [ "$PX_USER" = user ]
+}
+
 @test "effective_proxy_string always carries a scheme" {
   parse_proxy 'user:pass@host:1080'
   [ "$(effective_proxy_string)" = "socks5://user:pass@host:1080" ]
@@ -111,4 +148,28 @@ setup() {
 @test "parse_proxy rejects a non-numeric port" {
   run parse_proxy 'host:notaport'
   [ "$status" -ne 0 ]
+}
+
+@test "cmd_run exports the proxy environment and passes args through" {
+  relay_is_active() { return 0; }
+  LOCAL_PORT=1081
+  IGNORE_HOSTS="localhost,127.0.0.0/8, ::1"
+  [ "$(cmd_run sh -c 'echo "$all_proxy"')" = "socks5h://127.0.0.1:1081" ]
+  [ "$(cmd_run sh -c 'echo "$HTTPS_PROXY"')" = "socks5h://127.0.0.1:1081" ]
+  [ "$(cmd_run sh -c 'echo "$no_proxy"')" = "localhost,127.0.0.0/8,::1" ]
+  [ "$(cmd_run printf '%s|%s' a 'b c')" = "a|b c" ]
+}
+
+@test "cmd_run propagates the command's exit code" {
+  relay_is_active() { return 0; }
+  LOCAL_PORT=1081
+  run cmd_run sh -c 'exit 42'
+  [ "$status" -eq 42 ]
+}
+
+@test "free_port lands above the relay port" {
+  LOCAL_PORT=49500
+  local p; p="$(free_port)"
+  [ -n "$p" ]
+  [ "$p" -gt 49500 ]
 }
