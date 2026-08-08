@@ -123,6 +123,71 @@ setup() {
   [ "$(gvariant_ignore_hosts)" = "['localhost', '127.0.0.0/8', '::1']" ]
 }
 
+# A bypass entry is a pattern for the desktop, not for this shell: splitting the
+# list in a directory that happens to contain a matching name must not expand it.
+@test "bypass entries are never glob-expanded" {
+  local d; d="$(mktemp -d)"
+  touch "$d/printer.local" "$d/decoy.local"
+  cd "$d"
+  [ "$(each_bypass_entry 'localhost,*.local' | tr '\n' ' ')" = "localhost *.local " ]
+  IGNORE_HOSTS='*.local'
+  [ "$(gvariant_ignore_hosts)" = "['*.local']" ]
+  cd "$ROOT"
+  rm -rf "$d"
+}
+
+@test "check_desktop_verdict flags a system proxy aimed elsewhere" {
+  [ "$(check_desktop_verdict manual '127.0.0.1:1081' '127.0.0.1:1081' up | cut -f1)" = pass ]
+  [ "$(check_desktop_verdict manual '10.0.0.9:8080' '127.0.0.1:1081' up | cut -f1)" = fail ]
+  [ "$(check_desktop_verdict manual '' '127.0.0.1:1081' up | cut -f1)" = fail ]
+  [ "$(check_desktop_verdict none ':' '127.0.0.1:1081' up | cut -f1)" = warn ]
+  [ "$(check_desktop_verdict auto ':' '127.0.0.1:1081' up | cut -f1)" = warn ]
+}
+
+@test "check_bind_verdict flags a relay that is not loopback-only" {
+  [ "$(check_bind_verdict '127.0.0.1:1081' | cut -f1)" = pass ]
+  [ "$(check_bind_verdict '[::1]:1081'     | cut -f1)" = pass ]
+  [ "$(check_bind_verdict '0.0.0.0:1081'   | cut -f1)" = fail ]
+  [ "$(check_bind_verdict '[::]:1081'      | cut -f1)" = fail ]
+  [ "$(check_bind_verdict '192.168.1.5:1081' | cut -f1)" = warn ]
+  [ "$(check_bind_verdict ''               | cut -f1)" = skip ]
+}
+
+@test "check_leak_verdict fails when proxied and direct share an address" {
+  [ "$(check_leak_verdict 1.2.3.4 1.2.3.4 | cut -f1)" = fail ]
+  [ "$(check_leak_verdict 1.2.3.4 5.6.7.8 | cut -f1)" = pass ]
+  [ "$(check_leak_verdict 1.2.3.4 ''      | cut -f1)" = pass ]
+}
+
+@test "geo_expected_country reads the tag back out of a username" {
+  [ "$(geo_expected_country 'user-country-GR')" = GR ]
+  [ "$(geo_expected_country 'user-country-GR-session-abc')" = GR ]
+  [ "$(geo_expected_country 'user-country-us')" = US ]
+  [ -z "$(geo_expected_country 'user-session-abc')" ]
+}
+
+@test "bypass_public_entries lists only what routes around the relay" {
+  [ -z "$(bypass_public_entries "$DEFAULT_IGNORE_HOSTS")" ]
+  [ "$(bypass_public_entries 'localhost,example.com,192.168.0.0/16')" = "example.com" ]
+  [ "$(bypass_public_entries 'localhost,*')" = "*" ]
+  [ -z "$(bypass_public_entries '172.16.0.0/12,172.31.5.5')" ]
+  [ "$(bypass_public_entries '172.32.0.1')" = "172.32.0.1" ]
+}
+
+@test "check_summary exits non-zero on a failure, and on a warning with --strict" {
+  _chk_pass=2; _chk_warn=0; _chk_fail=0
+  run check_summary "" ""
+  [ "$status" -eq 0 ]
+  _chk_warn=1
+  run check_summary "" ""
+  [ "$status" -eq 0 ]
+  run check_summary "" 1
+  [ "$status" -eq 1 ]
+  _chk_warn=0; _chk_fail=1
+  run check_summary "" ""
+  [ "$status" -eq 1 ]
+}
+
 @test "json_esc escapes quotes" {
   [ "$(json_esc 'a"b')" = 'a\"b' ]
 }
@@ -142,6 +207,23 @@ setup() {
   grep -q 'socks5h://127.0.0.1:1081' "$ENV_FILE"
   _env_write off
   ! _env_is_on
+  rm -rf "$d"
+}
+
+# The endpoint must come from the file, not from the current LOCAL_PORT: those
+# drift apart when local_port changes without a re-apply, and rebuilding it here
+# would hide the drift the desktop check exists to find.
+@test "env backend_socks reports what the file exports" {
+  local d; d="$(mktemp -d)"
+  CONF_DIR="$d"; ENV_FILE="$d/env.sh"; LOCAL_PORT=1081; IGNORE_HOSTS="localhost"
+  BACKEND="env"
+  _env_write on
+  [ "$(backend_socks)" = "127.0.0.1:1081" ]
+  LOCAL_PORT=1099
+  [ "$(backend_socks)" = "127.0.0.1:1081" ]
+  [ "$(check_desktop_verdict "$(backend_mode)" "$(backend_socks)" '127.0.0.1:1099' up | cut -f1)" = fail ]
+  _env_write off
+  [ "$(backend_socks)" = ":" ]
   rm -rf "$d"
 }
 

@@ -109,6 +109,16 @@ chk "mask scheme noauth" "socks5://host:1080"        "$(mask 'socks5://host:1080
 IGNORE_HOSTS="localhost,127.0.0.0/8, ::1"
 chk "gvariant array" "['localhost', '127.0.0.0/8', '::1']" "$(gvariant_ignore_hosts)"
 
+# A bypass entry is a pattern for the desktop to match hostnames against, not
+# one for this shell to expand: splitting the list in a directory that contains
+# a matching filename must leave the entry alone.
+_bp_tmp="$(mktemp -d)"; touch "$_bp_tmp/printer.local" "$_bp_tmp/decoy.local"
+chk "bypass entries are not globbed" "localhost *.local " \
+  "$(cd "$_bp_tmp" && each_bypass_entry 'localhost,*.local' | tr '\n' ' ')"
+IGNORE_HOSTS='*.local'
+chk "gvariant does not glob" "['*.local']" "$(cd "$_bp_tmp" && gvariant_ignore_hosts)"
+rm -rf "$_bp_tmp"
+
 # --- detect_backend maps desktops to backends ---
 chk "detect gnome"    "gnome" "$(XDG_CURRENT_DESKTOP=GNOME      DESKTOP_SESSION='' detect_backend)"
 chk "detect kde"      "kde"   "$(XDG_CURRENT_DESKTOP=KDE        DESKTOP_SESSION='' detect_backend)"
@@ -128,8 +138,20 @@ IGNORE_HOSTS="localhost,127.0.0.0/8"
 _env_write on
 chk "env on is_on"  "on"                        "$(_env_is_on && echo on || echo off)"
 chk "env on url"    "socks5h://127.0.0.1:1081"  "$(grep -o 'socks5h://127.0.0.1:1081' "$ENV_FILE" | head -1)"
+# backend_socks must report what the file actually exports, not what LOCAL_PORT
+# happens to be now: those drift apart when local_port changes without a
+# re-apply, and that drift is the whole point of the desktop check.
+# shellcheck disable=SC2034  # read by backend_socks in the sourced script
+BACKEND="env"
+chk "env socks from the file" "127.0.0.1:1081" "$(backend_socks)"
+LOCAL_PORT=1099
+chk "env socks ignores a changed port" "127.0.0.1:1081" "$(backend_socks)"
+chk "env desktop check sees the drift" "fail" \
+  "$(check_desktop_verdict "$(backend_mode)" "$(backend_socks)" "127.0.0.1:1099" up | cut -f1)"
+LOCAL_PORT=1081
 _env_write off
 chk "env off is_on" "off"                        "$(_env_is_on && echo on || echo off)"
+chk "env socks when off" ":" "$(backend_socks)"
 rm -rf "$_bk_tmp"
 
 # --- json_esc ---
@@ -261,6 +283,91 @@ chk "free_port is above the relay port" "yes" \
   "$({ [ -n "$_fp" ] && [ "$_fp" -gt 49500 ]; } && echo yes || echo no)"
 # shellcheck disable=SC2034  # restored for any test appended after this one
 LOCAL_PORT=1081
+
+# --- check: pure verdicts (no network, no desktop, no systemd) ---
+# check_desktop_verdict: the dangerous case is a manual mode aimed elsewhere.
+chk "desktop points at the relay" \
+  "pass	system proxy points at the relay (127.0.0.1:1081)" \
+  "$(check_desktop_verdict manual '127.0.0.1:1081' '127.0.0.1:1081' up)"
+chk "desktop points elsewhere is a failure" \
+  "fail	system proxy points at 10.0.0.9:8080, not at the relay (127.0.0.1:1081)" \
+  "$(check_desktop_verdict manual '10.0.0.9:8080' '127.0.0.1:1081' up)"
+chk "desktop unset is a failure" \
+  "fail	system proxy points at nothing, not at the relay (127.0.0.1:1081)" \
+  "$(check_desktop_verdict manual '' '127.0.0.1:1081' up)"
+chk "desktop direct with a live relay warns" "warn" \
+  "$(check_desktop_verdict none ':' '127.0.0.1:1081' up | cut -f1)"
+chk "desktop on a PAC warns" "warn" \
+  "$(check_desktop_verdict auto ':' '127.0.0.1:1081' up | cut -f1)"
+
+# check_bind_verdict: a relay off loopback is an open proxy for the LAN.
+chk "bind loopback"      "pass" "$(check_bind_verdict '127.0.0.1:1081' | cut -f1)"
+chk "bind v6 loopback"   "pass" "$(check_bind_verdict '[::1]:1081'     | cut -f1)"
+chk "bind wildcard"      "fail" "$(check_bind_verdict '0.0.0.0:1081'   | cut -f1)"
+chk "bind v6 wildcard"   "fail" "$(check_bind_verdict '[::]:1081'      | cut -f1)"
+chk "bind lan address"   "warn" "$(check_bind_verdict '192.168.1.5:1081' | cut -f1)"
+chk "bind unreadable"    "skip" "$(check_bind_verdict ''               | cut -f1)"
+
+# check_leak_verdict: same address proxied and direct means nothing is proxied.
+chk "leak same ip fails"   "fail" "$(check_leak_verdict 1.2.3.4 1.2.3.4 | cut -f1)"
+chk "leak differing ips"   "pass" "$(check_leak_verdict 1.2.3.4 5.6.7.8 | cut -f1)"
+chk "leak no direct route" \
+  "pass	no direct route to the internet; nothing can slip past the relay" \
+  "$(check_leak_verdict 1.2.3.4 '')"
+
+# geo_expected_country: read the tag back out of a username.
+chk "geo from country tag" "GR" "$(geo_expected_country 'user-country-GR')"
+chk "geo stops at the next tag" "GR" "$(geo_expected_country 'user-country-GR-session-abc')"
+chk "geo upcases" "US" "$(geo_expected_country 'user-country-us')"
+chk "geo empty when untagged" "" "$(geo_expected_country 'user-session-abc')"
+_ck_saved_kw="$COUNTRY_KEYWORD"
+COUNTRY_KEYWORD="_country_"
+chk "geo honours the keyword" "GR" "$(geo_expected_country 'user_country_GR_session_abc')"
+COUNTRY_KEYWORD="$_ck_saved_kw"
+
+# bypass_public_entries: only entries that really route around the relay.
+chk "bypass defaults are all private" "" \
+  "$(bypass_public_entries "$DEFAULT_IGNORE_HOSTS")"
+chk "bypass flags a public host" "example.com" \
+  "$(bypass_public_entries 'localhost,127.0.0.0/8,example.com,192.168.0.0/16')"
+chk "bypass flags a wildcard" "*" "$(bypass_public_entries 'localhost,*')"
+chk "bypass keeps 172.16/12 private" "" "$(bypass_public_entries '172.16.0.0/12,172.31.5.5')"
+chk "bypass treats 172.32 as public" "172.32.0.1" "$(bypass_public_entries '172.32.0.1')"
+chk "bypass ignores whitespace" "" "$(bypass_public_entries ' localhost , ::1 , *.local ')"
+
+# check_row tallies and builds one JSON object per row.
+_chk_pass=0; _chk_warn=0; _chk_fail=0; _chk_json=""; _chk_quiet=1
+check_row relay pass "listening"
+check_row ipv6  warn "reachable directly"
+check_row geo   fail "wrong country"
+check_row bind  skip "not listening"
+chk "check_row counts passes"   "1" "$_chk_pass"
+chk "check_row counts warnings" "1" "$_chk_warn"
+chk "check_row counts failures" "1" "$_chk_fail"
+chk "check_row skips are untallied" "3" "$((_chk_pass + _chk_warn + _chk_fail))"
+chk "check_row joins rows with a comma" "4" "$(printf '%s' "$_chk_json" | grep -o '{' | wc -l)"
+_chk_json=""
+check_row relay pass 'listening on "1081"'
+chk "check_row emits json" '{"name":"relay","status":"pass","detail":"listening on \"1081\""}' \
+  "$_chk_json"
+
+# check_summary decides the exit status: failures always, warnings with --strict.
+_chk_pass=2; _chk_warn=0; _chk_fail=0
+_cs=0; check_summary "" "" >/dev/null || _cs=$?
+chk "summary clean exits 0" "0" "$_cs"
+_chk_warn=1
+_cs=0; check_summary "" "" >/dev/null || _cs=$?
+chk "summary warning exits 0" "0" "$_cs"
+_cs=0; check_summary "" 1 >/dev/null || _cs=$?
+chk "summary warning exits 1 under --strict" "1" "$_cs"
+_chk_warn=0; _chk_fail=1
+_cs=0; check_summary "" "" >/dev/null || _cs=$?
+chk "summary failure exits 1" "1" "$_cs"
+_chk_json='{"name":"relay","status":"pass","detail":"listening"}'
+chk "summary --json is one document" \
+  '{"version":"'"$VERSION"'","pass":0,"warn":0,"fail":1,"checks":[{"name":"relay","status":"pass","detail":"listening"}]}' \
+  "$(_chk_pass=0; check_summary 1 "" || true)"
+_chk_quiet=""
 
 # --- bad port must error ---
 ( parse_proxy 'host:notaport' ) 2>/dev/null \

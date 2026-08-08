@@ -11,6 +11,7 @@ _socksy() {
     'run:run one command through the relay only'
     'status:show current state'
     'test:print the current exit IP'
+    'check:audit for leaks (DNS, IPv6, bypass, geo)'
     'watch:live exit-IP loop'
     'watchdog:auto-restart the relay when the exit goes bad'
     'logs:show the relay journal'
@@ -36,6 +37,8 @@ _socksy() {
       _values 'bypass action' list add rm reset ;;
     status)
       _values 'flag' '--json' ;;
+    check)
+      _values 'flag' '--json' '--strict' ;;
     logs)
       _values 'flag' '-f' '-n' ;;
     use|rm)

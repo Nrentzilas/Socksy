@@ -58,6 +58,7 @@ relay. You get system-wide, authenticated SOCKS5 with zero fuss.
 - **Country builder**: `--country GR` tags the username for a geo-targeted exit.
 - **SOCKS5 / HTTP / HTTPS upstreams**: `--type http` for proxies that aren't SOCKS.
 - **Takes your provider's format**: `host:port:user:pass` works anywhere a proxy is accepted.
+- **Leak audit**: `socksy check` proves where your traffic really exits, in one command.
 - **Remote DNS**: `socksy dns on` stops Firefox DNS leaks.
 - **LAN bypass**: `socksy bypass` manages the no-proxy list (localhost, `.local`, RFC1918).
 - **Health watchdog**: `socksy watchdog on` auto-restarts the relay when the exit goes bad.
@@ -124,6 +125,7 @@ socksy run [--profile <n>] <cmd>    # proxy one command, leave the desktop alone
 socksy status                       # what's active right now
 socksy status --json                # machine-readable status (for scripts)
 socksy test                         # print the current exit IP
+socksy check [--json] [--strict]    # audit for leaks (DNS, IPv6, bypass, geo)
 socksy watch [seconds]              # live exit-IP loop (default 5s; flags changes)
 socksy watchdog on|off|status       # auto-restart the relay when the exit goes bad
 socksy logs [-f] [-n <lines>]       # tail the relay's journal
@@ -186,6 +188,58 @@ socksy rotate home2      # switch to a specific tag
 Any existing session tag is replaced rather than stacked, and everything else
 about the proxy (country tag, type, credentials) is kept.
 
+### Leak audit
+
+`socksy status` tells you what socksy configured. `socksy check` tells you what
+actually happens:
+
+```bash
+socksy check              # human-readable audit
+socksy check --json       # same result, for scripts and CI
+socksy check --strict     # exit non-zero on warnings too, not just failures
+```
+
+```
+socksy check (what actually happens, not what was configured)
+
+  ✔ relay    listening on 127.0.0.1:1081
+  ✔ bind     bound to 127.0.0.1, loopback only
+  ✔ desktop  system proxy points at the relay (127.0.0.1:1081)
+  ✔ exit     requests leave as 91.140.29.82
+  ✔ leak     relay exits as 91.140.29.82; unproxied traffic would leave as 31.152.249.41
+  ! ipv6     reachable directly as 2a02:1388:...; apps that ignore the system proxy leave over IPv6
+  ! dns      Firefox is installed and will resolve names locally; fix with 'socksy dns on'
+  ✔ geo      exit is in GR, matching the -country-GR tag
+  ✔ bypass   only loopback and private ranges skip the proxy
+  ✔ creds    read from a 600 config file, not from gost's command line
+
+2 warning(s), 8 ok, nothing failed.
+```
+
+Each row is an independent probe, so one failure never hides the rest:
+
+| check | what it catches |
+| --- | --- |
+| `relay` | the relay is not accepting connections, so proxied apps fail closed |
+| `bind` | the relay listens off loopback, i.e. anyone on your LAN can use your paid proxy |
+| `desktop` | the system proxy is aimed somewhere other than the relay, so nothing reaches the exit |
+| `exit` | the upstream is unreachable or the credentials are wrong |
+| `leak` | requests leave from the same address with and without the proxy: traffic is not being proxied |
+| `ipv6` | a working direct IPv6 route, which anything ignoring the system proxy can still leave by |
+| `dns` | Firefox is set to resolve names locally, leaking every hostname you visit |
+| `geo` | the exit is not in the country the username asked for |
+| `bypass` | a no-proxy entry that is neither loopback nor private, so that traffic skips the relay |
+| `creds` | the upstream password is on gost's command line, readable by any local user in `ps` |
+
+The exit status is non-zero if anything failed, which makes it usable as a gate:
+
+```bash
+socksy check --json --strict || notify-send "socksy: proxy posture degraded"
+```
+
+The three endpoints it probes (`ip_url`, `ipv6_url`, `geo_url`) are config keys,
+so you can point them at your own hosts instead of the public defaults.
+
 ### Config file (optional)
 
 Set your own defaults in `~/.config/socksy/config` (simple `key = value` lines,
@@ -204,6 +258,9 @@ health_fails    = 2               # restart the relay after N consecutive failur
 health_url      = https://api.ipify.org
 backend         = gnome           # desktop proxy backend: gnome | kde | env (default: autodetect)
 relay_creds     = auto            # how creds reach gost: auto | file | args
+ip_url          = https://api.ipify.org    # check/test: echoes back the caller's address
+ipv6_url        = https://api6.ipify.org   # check: same, over IPv6 only
+geo_url         = https://ipinfo.io/country  # check: answers with a two-letter country code
 ```
 
 Precedence is **environment variable → config file → built-in default**, so an
@@ -313,13 +370,13 @@ Done recently:
 - [x] KDE and non-GNOME backends (autodetected; `env`-file fallback for CLI-only)
 - [x] Per-app proxying (`socksy run`) and one-command rotation (`socksy rotate`)
 - [x] Keep proxy credentials out of the relay's command line
+- [x] `socksy check`: a leak audit (DNS, IPv6, bind, bypass, exit geo) in one command
 
 Still ahead:
 
-- [ ] GUI / tray applet
 - [ ] Packaging: `.rpm` / `.deb`
 - [ ] Profile pools with automatic failover in the watchdog
-- [ ] `socksy check`: a leak audit (DNS, IPv6, exit geo) in one command
+- [ ] GUI / tray applet
 
 Contributions welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 

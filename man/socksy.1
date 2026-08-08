@@ -1,5 +1,5 @@
 .\" Manpage for socksy.
-.TH SOCKSY 1 "2026-08-07" "socksy 0.4.0" "User Commands"
+.TH SOCKSY 1 "2026-08-08" "socksy 0.5.0" "User Commands"
 .SH NAME
 socksy \- the easy way to run an authenticated SOCKS5 proxy system-wide on Linux desktops
 .SH SYNOPSIS
@@ -91,6 +91,26 @@ print machine-readable output.
 .B test
 Print the current exit IP.
 .TP
+.BR "check " [ --json "] [" --strict ]
+Audit for leaks.
+.B status
+reports what socksy configured;
+.B check
+probes what actually happens and prints one row per finding: whether the relay
+is listening and bound to loopback only, whether the system proxy points at it,
+where requests really exit, whether the machine reaches that same address with
+no proxy at all (which would mean nothing is being proxied), whether a direct
+IPv6 route or a public bypass entry routes around the relay, whether Firefox
+still resolves names locally, whether the exit matches a
+.B --country
+tag, and whether the upstream credentials are visible in
+.BR ps .
+Exits non-zero if any check failed, or with
+.B --strict
+on any warning as well.
+.B --json
+prints the whole audit as one document for scripts and CI.
+.TP
 .BI "watch " [seconds]
 Live exit-IP loop (default 5s); flags every change.
 .TP
@@ -150,8 +170,19 @@ holds optional
 defaults (parsed, never executed). Recognised keys:
 .BR local_port ", " gost_version ", " gost_path ", " session_keyword ", "
 .BR country_keyword ", " type ", " ignore_hosts ", " health_interval ", "
-.BR health_fails ", " health_url ", " backend ", " relay_creds .
+.BR health_fails ", " health_url ", " backend ", " relay_creds ", " ip_url ", "
+.BR ipv6_url ", " geo_url .
 Precedence is environment variable, then config file, then built-in default.
+.TP
+.BR ip_url ", " ipv6_url ", " geo_url
+Endpoints used to observe an exit.
+.B ip_url
+and
+.B ipv6_url
+must echo the caller's address back as plain text;
+.B geo_url
+must answer with a two-letter country code. All three may be pointed at a
+self-hosted equivalent instead of the public defaults.
 .TP
 .B relay_creds
 How the upstream credentials reach
@@ -199,6 +230,11 @@ binary to use, instead of letting socksy find or download one.
 How credentials reach the relay:
 .BR file ", " args ", or " auto
 (default).
+.TP
+.B SOCKSY_IP_URL ", " SOCKSY_IPV6_URL ", " SOCKSY_GEO_URL
+Endpoints used by
+.BR check " (and " test ")"
+to observe an exit.
 .SH FILES
 .TP
 .I ~/.local/bin/socksy
@@ -265,6 +301,14 @@ Proxy a single application, leaving the desktop direct:
 .RS
 .EX
 socksy run --profile work firefox
+.EE
+.RE
+.PP
+Audit the current posture, treating warnings as failures:
+.PP
+.RS
+.EX
+socksy check --strict
 .EE
 .RE
 .SH SECURITY

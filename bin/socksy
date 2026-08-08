@@ -12,7 +12,7 @@
 #
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 # ---- paths ------------------------------------------------------------------
 # Absolute path to this script, for baking into systemd units (watchdog).
@@ -41,13 +41,14 @@ DESKTOP_SNAPSHOT="$CONF_DIR/desktop.orig"  # pre-socksy desktop proxy values
 # ---- config file ------------------------------------------------------------
 # Optional ~/.config/socksy/config with simple "key = value" lines. Recognised:
 #   local_port, gost_version, gost_path, session_keyword, country_keyword, type,
-#   ignore_hosts, health_*, backend, relay_creds
+#   ignore_hosts, health_*, backend, relay_creds, ip_url, ipv6_url, geo_url
 # Unknown keys are ignored. The file is parsed (not sourced) so it can't run code.
 # Precedence for every default below: environment variable > config file > built-in.
 cfg_local_port=""; cfg_gost_version=""; cfg_session_keyword=""
 cfg_country_keyword=""; cfg_type=""; cfg_ignore_hosts=""
 cfg_health_interval=""; cfg_health_fails=""; cfg_health_url=""; cfg_backend=""
 cfg_gost_path=""; cfg_relay_creds=""
+cfg_ip_url=""; cfg_ipv6_url=""; cfg_geo_url=""
 load_config() {
   [ -f "$CONFIG_FILE" ] || return 0
   local line key val
@@ -77,6 +78,9 @@ load_config() {
       backend)         cfg_backend="$val" ;;
       gost_path)       cfg_gost_path="$val" ;;
       relay_creds)     cfg_relay_creds="$val" ;;
+      ip_url)          cfg_ip_url="$val" ;;
+      ipv6_url)        cfg_ipv6_url="$val" ;;
+      geo_url)         cfg_geo_url="$val" ;;
       *) ;;                                   # ignore unknown keys
     esac
   done < "$CONFIG_FILE"
@@ -113,6 +117,12 @@ HEALTH_INTERVAL="${SOCKSY_HEALTH_INTERVAL:-${cfg_health_interval:-30}}"
 HEALTH_FAILS="${SOCKSY_HEALTH_FAILS:-${cfg_health_fails:-2}}"
 HEALTH_URL="${SOCKSY_HEALTH_URL:-${cfg_health_url:-https://api.ipify.org}}"
 HEALTH_MAXTIME=15               # per-probe curl timeout (seconds)
+# Endpoints used to observe an exit. IP_URL and IPV6_URL must echo back the
+# caller's address as plain text; GEO_URL must answer with its two-letter
+# country code. All three are swappable for a self-hosted equivalent.
+IP_URL="${SOCKSY_IP_URL:-${cfg_ip_url:-https://api.ipify.org}}"
+IPV6_URL="${SOCKSY_IPV6_URL:-${cfg_ipv6_url:-https://api6.ipify.org}}"
+GEO_URL="${SOCKSY_GEO_URL:-${cfg_geo_url:-https://ipinfo.io/country}}"
 # How the upstream credentials reach gost:
 #   file  via a 600 config file        (creds stay out of /proc/<pid>/cmdline)
 #   args  via -F on the command line   (the pre-0.4 behaviour)
@@ -615,18 +625,40 @@ backend_socks() {
            echo "${h}:${p}" ;;
     kde)   local v; v="$(_kread --file kioslaverc --group "Proxy Settings" --key socksProxy 2>/dev/null)"
            v="${v#socks://}"; echo "${v// /:}" ;;
-    env)   _env_is_on && echo "127.0.0.1:${LOCAL_PORT}" || echo ":" ;;
+    # Read the endpoint back out of the file rather than rebuilding it from
+    # LOCAL_PORT. The two drift apart whenever local_port changes without a
+    # re-apply, and reporting the current port here would hide exactly that:
+    # the shell would still be sourcing the old one.
+    env)   local u
+           if ! _env_is_on; then echo ":"; return 0; fi
+           u="$(sed -n 's/^export all_proxy="\([^"]*\)".*/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
+           u="${u#*://}"
+           echo "${u:-:}" ;;
   esac
+}
+
+# Split a comma-separated bypass list into trimmed entries, one per line.
+# Globbing is off while the list is split: an entry like '*.local' is a pattern
+# for the desktop to match hostnames against, not for this shell to expand
+# against the working directory.
+each_bypass_entry() {   # $1 = comma-separated list
+  local h reset="" IFS=,
+  case "$-" in *f*) ;; *) reset=1 ;; esac
+  set -f
+  for h in ${1:-}; do
+    h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"   # trim
+    [ -n "$h" ] && printf '%s\n' "$h"
+  done
+  [ -z "$reset" ] || set +f
+  return 0
 }
 
 # Build a GNOME ignore-hosts array literal from the comma-separated list.
 gvariant_ignore_hosts() {
-  local out="" h IFS=,
-  for h in $IGNORE_HOSTS; do
-    h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"   # trim
-    [ -n "$h" ] || continue
+  local out="" h
+  while IFS= read -r h; do
     out="${out:+$out, }'${h}'"
-  done
+  done < <(each_bypass_entry "$IGNORE_HOSTS")
   echo "[${out}]"
 }
 
@@ -903,7 +935,12 @@ cmd_status() {
   fi
   echo "${B}bypass     :${X} ${IGNORE_HOSTS}"
   [ -s "$LAST" ] && echo "${B}last proxy :${X} $(mask "$(cat "$LAST")")"
-  [ "$BACKEND" = env ] && echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
+  # Explicit, because this test is the function's last statement: on any backend
+  # other than 'env' it is false, and 'socksy status' would exit non-zero.
+  if [ "$BACKEND" = env ]; then
+    echo "${DIM}source ${ENV_FILE} to apply the exports in a shell.${X}"
+  fi
+  return 0
 }
 
 # Block until the relay accepts TCP on its port, or give up after ~6s.
@@ -921,7 +958,7 @@ wait_for_relay() {
 
 cmd_test() {
   local ip
-  ip="$(curl -fsS --max-time 25 -x "socks5h://127.0.0.1:${LOCAL_PORT}" https://api.ipify.org 2>/dev/null)" \
+  ip="$(curl -fsS --max-time 25 -x "socks5h://127.0.0.1:${LOCAL_PORT}" "$IP_URL" 2>/dev/null)" \
     || { warn "could not reach the internet through the relay."; return 1; }
   ok "exit IP: ${B}${ip}${X}"
 }
@@ -934,7 +971,7 @@ cmd_watch() {
   info "watching exit IP via 127.0.0.1:${LOCAL_PORT} every ${interval}s (Ctrl-C to stop)"
   local last="" ip ts
   while true; do
-    ip="$(curl -fsS --max-time 20 -x "socks5h://127.0.0.1:${LOCAL_PORT}" https://api.ipify.org 2>/dev/null || true)"
+    ip="$(curl -fsS --max-time 20 -x "socks5h://127.0.0.1:${LOCAL_PORT}" "$IP_URL" 2>/dev/null || true)"
     ts="$(date +%H:%M:%S)"
     if [ -z "$ip" ]; then
       echo "${ts}  ${Y}(no response)${X}"
@@ -945,6 +982,284 @@ cmd_watch() {
     fi
     sleep "$interval"
   done
+}
+
+# ---- check: one-command leak audit ------------------------------------------
+# 'status' reports what socksy configured. 'check' verifies that traffic really
+# behaves that way: that the desktop points at the relay and nothing else, that
+# the relay is loopback-only, that requests leave from the exit rather than the
+# local link, that the exit is where it was asked to be, and that the obvious
+# ways around the relay (a direct IPv6 route, an over-broad bypass entry,
+# Firefox resolving names locally) are closed.
+#
+# Every row is an independent probe, so one failure never hides the rest. The
+# verdicts are pure functions of their inputs, kept apart from the probes so the
+# test suite can exercise them without a network, a desktop, or systemd.
+CHECK_MAXTIME=15
+_chk_pass=0; _chk_warn=0; _chk_fail=0; _chk_json=""; _chk_quiet=""
+
+check_row() {   # name, status (pass|warn|fail|skip), detail
+  local name="$1" status="$2" detail="$3" glyph
+  case "$status" in
+    pass) glyph="${G}✔${X}"; _chk_pass=$((_chk_pass + 1)) ;;
+    warn) glyph="${Y}!${X}"; _chk_warn=$((_chk_warn + 1)) ;;
+    fail) glyph="${R}✘${X}"; _chk_fail=$((_chk_fail + 1)) ;;
+    *)    glyph="${DIM}-${X}" ;;
+  esac
+  _chk_json="${_chk_json}${_chk_json:+,}$(printf '{"name":"%s","status":"%s","detail":"%s"}' \
+      "$(json_esc "$name")" "$(json_esc "$status")" "$(json_esc "$detail")")"
+  [ -n "$_chk_quiet" ] || printf '  %s %-8s %s\n' "$glyph" "$name" "$detail"
+}
+
+# Emit a row from a "status<TAB>detail" verdict.
+check_row_from() { local v="$2"; check_row "$1" "${v%%$'\t'*}" "${v#*$'\t'}"; }
+
+# ---- pure verdicts ----------------------------------------------------------
+# Does the desktop's system proxy actually send traffic to our relay? A manual
+# mode pointing somewhere else is the dangerous case: everything looks proxied
+# and none of it reaches the exit.
+check_desktop_verdict() {   # mode, actual host:port, expected host:port, relay up|down
+  case "$1" in
+    manual)
+      if [ "$2" = "$3" ]; then printf 'pass\tsystem proxy points at the relay (%s)' "$3"
+      else printf 'fail\tsystem proxy points at %s, not at the relay (%s)' "${2:-nothing}" "$3"; fi ;;
+    auto)
+      printf 'warn\tsystem proxy comes from an autoconfig (PAC) file; socksy is not in control' ;;
+    *)
+      if [ "$4" = up ]; then
+        printf 'warn\tsystem proxy is direct; only "socksy run" traffic uses the relay'
+      else
+        printf 'warn\tsystem proxy is direct and the relay is stopped'
+      fi ;;
+  esac
+}
+
+# gost is told to listen on 127.0.0.1, but a hand-edited unit or a user-supplied
+# config could widen that, which turns a paid proxy into an open one for the LAN.
+check_bind_verdict() {   # listening address as printed by ss ("127.0.0.1:1081")
+  local host="${1%:*}"
+  [ -n "${1:-}" ] || { printf 'skip\tcould not read the listening socket'; return 0; }
+  case "$host" in
+    127.*|'[::1]'|localhost) printf 'pass\tbound to %s, loopback only' "$host" ;;
+    '0.0.0.0'|'[::]'|'*'|'')
+      printf 'fail\tbound to %s: anyone who can reach this host can use your proxy' "${host:-*}" ;;
+    *) printf 'warn\tbound to %s, which is not loopback; check who can reach it' "$host" ;;
+  esac
+}
+
+# Compare the exit as seen through the relay against the address the machine
+# uses with no proxy at all.
+check_leak_verdict() {   # proxied ip, direct ip
+  if [ -z "$2" ]; then
+    printf 'pass\tno direct route to the internet; nothing can slip past the relay'
+  elif [ "$1" = "$2" ]; then
+    printf 'fail\tdirect requests leave from %s, the same address as the relay: traffic is not being proxied' "$2"
+  else
+    printf 'pass\trelay exits as %s; unproxied traffic would leave as %s' "$1" "$2"
+  fi
+}
+
+# The country code a proxy username asks for, if it carries a country tag. The
+# tag runs from the keyword to the next separator, so a session tag after it is
+# not mistaken for part of the code.
+geo_expected_country() {   # username
+  local rest
+  case "${1:-}" in *"$COUNTRY_KEYWORD"*) ;; *) return 0 ;; esac
+  rest="${1#*"$COUNTRY_KEYWORD"}"
+  rest="${rest%%-*}"; rest="${rest%%_*}"
+  printf '%s' "$rest" | tr '[:lower:]' '[:upper:]'
+}
+
+# Bypass entries that are neither loopback, private, nor link-local. Those are
+# the ones that genuinely route around the relay.
+bypass_public_entries() {   # comma-separated bypass list
+  local h out=""
+  while IFS= read -r h; do
+    case "$h" in
+      localhost|127.*|10.*|192.168.*|169.254.*|::1|'[::1]'|fe80:*|fc*:*|fd*:*) continue ;;
+      172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
+      *.local|*.localdomain|*.internal|*.lan|*.home.arpa) continue ;;
+    esac
+    out="${out:+$out }$h"
+  done < <(each_bypass_entry "$1")
+  printf '%s' "$out"
+}
+
+# ---- probes -----------------------------------------------------------------
+_via_relay()   { curl -fsS --max-time "$CHECK_MAXTIME" -x "socks5h://127.0.0.1:${LOCAL_PORT}" "$1" 2>/dev/null || true; }
+# --noproxy '*' beats any *_proxy variable in the environment, so "direct"
+# really is direct even when the caller's shell is already proxied.
+_via_direct()  { curl -fsS --max-time "$CHECK_MAXTIME" --noproxy '*' "$1" 2>/dev/null || true; }
+_via_direct6() { curl -fsS --max-time "$CHECK_MAXTIME" --noproxy '*' -6 "$1" 2>/dev/null || true; }
+_oneline()     { printf '%s' "${1:-}" | tr -d '[:space:]'; }
+
+# The address the relay is actually listening on. Empty if it cannot be read.
+relay_bind_addr() {
+  have ss || return 0
+  ss -ltn 2>/dev/null | awk -v p=":${LOCAL_PORT}\$" '$4 ~ p { print $4; exit }'
+}
+
+# Is socksy's remote-DNS pref really in a Firefox profile? The state file says
+# what was asked for; user.js says what Firefox will do.
+_ff_pref_is_true() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    grep -qs 'network\.proxy\.socks_remote_dns", true' "$d/user.js" && return 0
+  done < <(_ff_profiles)
+  return 1
+}
+
+cmd_check() {
+  local json="" strict=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)   json=1; _chk_quiet=1 ;;
+      --strict) strict=1 ;;
+      "") ;;
+      *) die "usage: socksy check [--json] [--strict]" ;;
+    esac
+    shift
+  done
+  have curl || die "curl is required by 'socksy check'."
+  backend_require
+
+  if [ -z "$json" ]; then
+    echo "${B}socksy check${X} ${DIM}(what actually happens, not what was configured)${X}"
+    echo
+  fi
+
+  local relay=down mode socks
+  if (: <>"/dev/tcp/127.0.0.1/${LOCAL_PORT}") 2>/dev/null; then relay=up; fi
+  mode="$(backend_mode)"
+  socks="$(backend_socks)"
+
+  # Nothing is applied, so there is nothing to audit. Say so once instead of
+  # reporting every downstream probe as a failure.
+  if [ "$relay" = down ] && [ "$mode" != manual ]; then
+    check_row proxy skip "socksy is off (relay stopped, system proxy direct); run 'socksy on' first"
+    check_summary "$json" "$strict" || return 1
+    return 0
+  fi
+
+  if [ "$relay" = up ]; then
+    check_row relay pass "listening on 127.0.0.1:${LOCAL_PORT}"
+  elif relay_is_active; then
+    check_row relay fail "service is active but nothing accepts on 127.0.0.1:${LOCAL_PORT} (see 'socksy logs')"
+  else
+    check_row relay fail "not running, so proxied apps fail closed rather than leak (see 'socksy logs')"
+  fi
+
+  if [ "$relay" = up ]; then
+    check_row_from bind "$(check_bind_verdict "$(relay_bind_addr)")"
+  else
+    check_row bind skip "relay is not listening"
+  fi
+
+  check_row_from desktop "$(check_desktop_verdict "$mode" "$socks" "127.0.0.1:${LOCAL_PORT}" "$relay")"
+
+  # Exit and leak. Both need the relay, so skip them rather than blame the
+  # network when it is down.
+  local exit_ip="" direct_ip=""
+  if [ "$relay" = up ]; then
+    exit_ip="$(_oneline "$(_via_relay "$IP_URL")")"
+    if [ -n "$exit_ip" ]; then
+      check_row exit pass "requests leave as ${exit_ip}"
+    else
+      check_row exit fail "no answer from ${IP_URL} through the relay; the upstream may be down or the credentials wrong"
+    fi
+  else
+    check_row exit skip "relay is not listening"
+  fi
+
+  direct_ip="$(_oneline "$(_via_direct "$IP_URL")")"
+  if [ -n "$exit_ip" ]; then
+    check_row_from leak "$(check_leak_verdict "$exit_ip" "$direct_ip")"
+  elif [ -n "$direct_ip" ]; then
+    check_row leak warn "the relay gave no exit to compare, but this machine reaches the internet directly as ${direct_ip}"
+  else
+    check_row leak skip "no exit and no direct route to compare"
+  fi
+
+  # The relay speaks IPv4 to the upstream. A working direct IPv6 route means
+  # anything that ignores the system proxy still has a way out, unproxied.
+  local v6; v6="$(_oneline "$(_via_direct6 "$IPV6_URL")")"
+  if [ -n "$v6" ]; then
+    check_row ipv6 warn "reachable directly as ${v6}; apps that ignore the system proxy leave over IPv6"
+  else
+    check_row ipv6 pass "no direct IPv6 route, so nothing can leak over it"
+  fi
+
+  # CLI tools using socks5h and Chrome already resolve at the exit. Firefox is
+  # the one that resolves locally unless the pref is set.
+  if [ ! -d "$FF_DIR" ]; then
+    check_row dns pass "no Firefox install; CLI (socks5h) and Chrome resolve at the exit"
+  elif _ff_pref_is_true; then
+    check_row dns pass "Firefox resolves names at the exit, as do CLI (socks5h) and Chrome"
+  elif dns_is_on; then
+    check_row dns fail "'socksy dns' is on, but no Firefox profile carries the pref; run 'socksy dns on' again"
+  else
+    check_row dns warn "Firefox is installed and will resolve names locally; fix with 'socksy dns on'"
+  fi
+
+  # Exit country against the country tag on the username, when there is one.
+  local want_cc="" got_cc=""
+  if [ -s "$LAST" ]; then
+    parse_proxy "$(cat "$LAST")"
+    want_cc="$(geo_expected_country "$PX_USER")"
+  fi
+  if [ -z "$want_cc" ]; then
+    check_row geo skip "no country tag on the proxy username; nothing to compare"
+  elif [ "$relay" = down ]; then
+    check_row geo skip "relay is not listening"
+  else
+    got_cc="$(_oneline "$(_via_relay "$GEO_URL")" | tr -dc 'A-Za-z' | tr '[:lower:]' '[:upper:]')"
+    if [ "${#got_cc}" -ne 2 ]; then
+      check_row geo warn "asked for ${want_cc}, but ${GEO_URL} did not answer with a country code"
+    elif [ "$got_cc" = "$want_cc" ]; then
+      check_row geo pass "exit is in ${got_cc}, matching the ${COUNTRY_KEYWORD}${want_cc} tag"
+    else
+      check_row geo fail "asked for ${want_cc}, but the exit is in ${got_cc}"
+    fi
+  fi
+
+  local public; public="$(bypass_public_entries "$IGNORE_HOSTS")"
+  if [ -n "$public" ]; then
+    check_row bypass warn "these skip the proxy entirely: ${public}"
+  else
+    check_row bypass pass "only loopback and private ranges skip the proxy"
+  fi
+
+  if grep -q -- ' -C ' "$UNIT" 2>/dev/null; then
+    check_row creds pass "read from a 600 config file, not from gost's command line"
+  else
+    check_row creds warn "on gost's command line, so any local user can read them from 'ps'; see 'relay_creds' in the docs"
+  fi
+
+  check_summary "$json" "$strict" || return 1
+  return 0
+}
+
+# Print the tally (or the whole JSON document) and decide the exit status.
+check_summary() {   # json flag, strict flag
+  if [ -n "$1" ]; then
+    printf '{"version":"%s","pass":%s,"warn":%s,"fail":%s,"checks":[%s]}\n' \
+      "$(json_esc "$VERSION")" "$_chk_pass" "$_chk_warn" "$_chk_fail" "$_chk_json"
+  else
+    echo
+    if [ "$_chk_fail" -gt 0 ]; then
+      echo "${R}${_chk_fail} failed${X}, ${_chk_warn} warning(s), ${_chk_pass} ok."
+    elif [ "$_chk_warn" -gt 0 ]; then
+      echo "${Y}${_chk_warn} warning(s)${X}, ${_chk_pass} ok, nothing failed."
+    elif [ "$_chk_pass" -eq 0 ]; then
+      echo "${DIM}nothing to audit.${X}"
+    else
+      ok "${_chk_pass} checks passed; no leaks found."
+    fi
+  fi
+  [ "$_chk_fail" -eq 0 ] || return 1
+  { [ -z "$2" ] || [ "$_chk_warn" -eq 0 ]; } || return 1
+  return 0
 }
 
 # ---- watchdog (health check + auto-reconnect) -------------------------------
@@ -1026,11 +1341,7 @@ cmd_bypass() {
   case "$action" in
     list|"")
       echo "${B}bypass ($(backend_label) no-proxy list):${X}"
-      local IFS=,
-      for h in $IGNORE_HOSTS; do
-        h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"
-        [ -n "$h" ] && echo "  $h"
-      done
+      while IFS= read -r h; do echo "  $h"; done < <(each_bypass_entry "$IGNORE_HOSTS")
       ;;
     add)
       host="${2:-}"; [ -n "$host" ] || die "usage: socksy bypass add <host>"
@@ -1043,8 +1354,9 @@ cmd_bypass() {
     rm|remove)
       host="${2:-}"; [ -n "$host" ] || die "usage: socksy bypass rm <host>"
       new=""
-      local IFS=,
-      for h in $IGNORE_HOSTS; do [ "$h" = "$host" ] || new="${new:+$new,}$h"; done
+      while IFS= read -r h; do
+        [ "$h" = "$host" ] || new="${new:+$new,}$h"
+      done < <(each_bypass_entry "$IGNORE_HOSTS")
       IGNORE_HOSTS="$new"; _save_ignore_hosts; ok "removed '${host}' from the bypass list."
       ;;
     reset)
@@ -1231,6 +1543,7 @@ ${B}USAGE${X}
   socksy run [--profile <n>] <cmd>    run one command through the relay only
   socksy status [--json]              show what's active (--json for scripts)
   socksy test                         print the current exit IP
+  socksy check [--json] [--strict]    audit for leaks (DNS, IPv6, bypass, geo)
   socksy watch [seconds]              live exit-IP loop (default 5s; flags changes)
   socksy watchdog on|off|status       auto-restart the relay when the exit goes bad
   socksy logs [-f] [-n <lines>]       show the relay's journal
@@ -1256,8 +1569,16 @@ ${B}SET FLAGS${X}
 ${B}CONFIG FILE${X} ${DIM}(${CONFIG_FILE}, optional)${X}
   ${DIM}key = value lines. Keys: local_port, gost_version, gost_path,${X}
   ${DIM}session_keyword, country_keyword, type, ignore_hosts, health_interval,${X}
-  ${DIM}health_fails, health_url, backend, relay_creds.${X}
+  ${DIM}health_fails, health_url, backend, relay_creds, ip_url, ipv6_url, geo_url.${X}
   ${DIM}Env vars still win over the file.${X}
+
+${B}CHECK${X}
+  ${DIM}'status' says what socksy configured; 'check' probes what actually${X}
+  ${DIM}happens: where requests really exit, whether the system proxy points${X}
+  ${DIM}at the relay, whether the relay is loopback-only, whether a direct${X}
+  ${DIM}IPv6 route or a bypass entry routes around it, whether Firefox still${X}
+  ${DIM}resolves names locally, and whether the exit matches a country tag.${X}
+  ${DIM}Exits non-zero if anything failed, or with --strict on any warning.${X}
 
 ${B}RELAY CREDENTIALS${X} ${DIM}(relay_creds = ${RELAY_CREDS})${X}
   ${DIM}file  hand gost a 600 config file, so the password never appears in${X}
@@ -1303,6 +1624,7 @@ case "${1:-}" in
   run)          shift; cmd_run "$@" ;;
   status)       shift; cmd_status "${1:-}" ;;
   test)         cmd_test ;;
+  check)        shift; cmd_check "$@" ;;
   watch)        shift; cmd_watch "${1:-}" ;;
   watchdog)     shift; cmd_watchdog "${1:-}" ;;
   logs)         shift; cmd_logs "$@" ;;
