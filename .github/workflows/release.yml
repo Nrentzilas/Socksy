@@ -21,6 +21,22 @@ jobs:
       - name: Build artifacts
         run: scripts/build-release.sh --check "$GITHUB_REF_NAME"
 
+      # nfpm is pure Go and writes the .deb and .rpm archives itself, so the
+      # runner needs no dpkg-dev or rpmbuild. Pinned so a release is not at the
+      # mercy of whatever nfpm published that morning.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Install nfpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Applies the same tag-vs-VERSION check to the packages, and rewrites
+      # SHA256SUMS to cover the tarball and both packages together.
+      - name: Build packages
+        run: scripts/build-packages.sh --check "$GITHUB_REF_NAME"
+
       - name: Verify checksum
         run: cd dist && sha256sum -c SHA256SUMS
 
@@ -38,16 +54,50 @@ jobs:
           test -f "$tmp/root/usr/share/zsh/site-functions/_socksy"
           "$tmp/root/usr/bin/socksy" --version
 
+      # Same idea for the .deb, but installed for real by the package manager,
+      # so a broken dependency or a bad path shows up here and not on a user's
+      # machine. apt resolves the declared dependencies; dpkg alone would not.
+      - name: Install the .deb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ./dist/socksy_*.deb
+          command -v socksy
+          # The tag may carry a prerelease suffix that the binary never does,
+          # so compare against the base version, exactly as the build scripts do.
+          base="${GITHUB_REF_NAME#v}"; base="${base%%-*}"
+          socksy --version | grep -q "$base"
+          test -f /usr/share/man/man1/socksy.1.gz
+          test -f /usr/share/bash-completion/completions/socksy
+          test -f /usr/share/zsh/site-functions/_socksy
+          test -f /usr/share/doc/socksy/LICENSE
+          sudo apt-get remove -y socksy
+          test ! -e /usr/bin/socksy
+
+      # The .rpm cannot be installed on an Ubuntu runner, so verify its metadata
+      # and file list instead: enough to catch a wrong arch, a missing
+      # dependency, or a payload that drifted from the .deb.
+      - name: Inspect the .rpm
+        run: |
+          sudo apt-get install -y rpm
+          rpm -qip dist/socksy-*.rpm
+          rpm -qlp dist/socksy-*.rpm
+          rpm -qpR dist/socksy-*.rpm | grep -qx bash
+          rpm -qpR dist/socksy-*.rpm | grep -qx curl
+          test "$(rpm -qp --qf '%{ARCH}' dist/socksy-*.rpm)" = noarch
+          rpm -qlp dist/socksy-*.rpm | grep -qx /usr/bin/socksy
+          rpm -qlp dist/socksy-*.rpm | grep -qx /usr/share/man/man1/socksy.1.gz
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" --clobber \
-              dist/socksy-*.tar.gz dist/SHA256SUMS
+              dist/socksy-*.tar.gz dist/socksy_*.deb dist/socksy-*.rpm dist/SHA256SUMS
             exit 0
           fi
           args=( "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes )
           # A tag with a suffix (v0.3.0-rc1) is a prerelease.
           case "$GITHUB_REF_NAME" in *-*) args+=( --prerelease ) ;; esac
-          gh release create "${args[@]}" dist/socksy-*.tar.gz dist/SHA256SUMS
+          gh release create "${args[@]}" \
+            dist/socksy-*.tar.gz dist/socksy_*.deb dist/socksy-*.rpm dist/SHA256SUMS

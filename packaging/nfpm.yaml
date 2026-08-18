@@ -1,0 +1,92 @@
+# nfpm configuration for the socksy .deb and .rpm.
+#
+# The payload is NOT listed by hand here: scripts/build-packages.sh stages it by
+# running install.sh with a DESTDIR, so a packaged install lands in exactly the
+# layout install.sh produces. This file only describes the metadata around it.
+#
+# The paths below are relative to the repository root and @VERSION@ is filled in
+# by the build script, so this file is not usable on its own. Build with:
+#
+#   scripts/build-packages.sh
+#
+name: socksy
+version: "@VERSION@"
+# Lets a prerelease tag (v0.6.0-rc1) render per-packager: 0.6.0~rc1 on deb,
+# which sorts *before* 0.6.0, rather than a literal that sorts after it.
+version_schema: semver
+platform: linux
+# socksy is a bash script with no compiled parts. nfpm renders this as 'all'
+# for deb and 'noarch' for rpm.
+arch: all
+
+section: net
+priority: optional
+maintainer: Nrentzilas <nrentzilas@gmail.com>
+vendor: Nrentzilas
+homepage: https://github.com/Nrentzilas/socksy
+license: MIT
+description: |
+  Run an authenticated SOCKS5 proxy system-wide on a Linux desktop.
+  Desktop proxy settings have no fields for a SOCKS username and password, so
+  authenticated proxies cannot be applied through the GUI at all. socksy runs a
+  local relay that holds the credentials and points the desktop at it, giving
+  you system-wide authenticated SOCKS5 from a single command. It autodetects
+  GNOME, KDE, or a CLI-only fallback, and prints your real exit IP on apply.
+  .
+  The relay binary (gost) is not packaged: socksy downloads a checksum-verified
+  copy into ~/.local/bin on first use, or uses one already on PATH.
+
+# Required at runtime. socksy is bash-only, probes the exit with curl (which it
+# also uses to fetch gost), and runs the relay as a systemd *user* service.
+depends:
+  - bash
+  - curl
+  - systemd
+
+# Both desktop backends are optional: socksy autodetects, and falls back to a
+# sourceable env file when neither is present. So neither is a hard dependency,
+# and the package names differ between the two ecosystems.
+overrides:
+  deb:
+    recommends:
+      - libglib2.0-bin      # gsettings, for the GNOME backend
+    suggests:
+      - kde-cli-tools       # kwriteconfig, for the KDE backend
+  rpm:
+    recommends:
+      - glib2               # gsettings, for the GNOME backend
+    suggests:
+      - kde-cli-tools       # kwriteconfig, for the KDE backend
+
+contents:
+  - src: ./dist/pkgroot/usr/bin/socksy
+    dst: /usr/bin/socksy
+    file_info:
+      mode: 0755
+
+  - src: ./dist/pkgroot/usr/share/bash-completion/completions/socksy
+    dst: /usr/share/bash-completion/completions/socksy
+    file_info:
+      mode: 0644
+
+  - src: ./dist/pkgroot/usr/share/zsh/site-functions/_socksy
+    dst: /usr/share/zsh/site-functions/_socksy
+    file_info:
+      mode: 0644
+
+  - src: ./dist/pkgroot/usr/share/man/man1/socksy.1.gz
+    dst: /usr/share/man/man1/socksy.1.gz
+    file_info:
+      mode: 0644
+
+  - src: ./dist/pkgroot/usr/share/doc/socksy/README.md
+    dst: /usr/share/doc/socksy/README.md
+    file_info:
+      mode: 0644
+
+  # Deliberately not "type: license": that is rpm-only semantics, and nfpm
+  # silently drops such an entry from the .deb rather than shipping it.
+  - src: ./dist/pkgroot/usr/share/doc/socksy/LICENSE
+    dst: /usr/share/doc/socksy/LICENSE
+    file_info:
+      mode: 0644

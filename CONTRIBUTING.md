@@ -14,7 +14,7 @@ contributing is easy.
 
 1. Run [ShellCheck](https://www.shellcheck.net/); CI runs it too:
    ```bash
-   shellcheck bin/socksy install.sh uninstall.sh
+   shellcheck bin/socksy install.sh uninstall.sh scripts/*.sh
    ```
 2. Run the unit tests (no dependencies needed; CI runs these too):
    ```bash
@@ -38,8 +38,8 @@ contributing is easy.
 
 See the **Roadmap** in the [README](README.md#roadmap) and the open
 [issues](https://github.com/Nrentzilas/socksy/issues). Good first issues:
-`.deb`/`.rpm` packaging, profile pools with watchdog failover, a `socksy check`
-leak audit, or porting more of `test/run.sh` into additional coverage.
+profile pools with watchdog failover, or porting more of `test/run.sh` into
+additional coverage.
 
 ## Commit style
 

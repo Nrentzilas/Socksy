@@ -69,7 +69,8 @@ relay. You get system-wide, authenticated SOCKS5 with zero fuss.
 - **Shell completions**: bash & zsh, including profile names.
 - **Instant feedback**: every apply prints your real exit IP.
 - **Clean off switch**: `socksy off` returns you to a direct connection.
-- **No root. No system packages.** Everything lives under `~/.local` and `~/.config`.
+- **No root needed.** The default install lives entirely under `~/.local` and
+  `~/.config`; a `.deb` and an `.rpm` are there if you would rather.
 
 ## Requirements
 
@@ -103,6 +104,37 @@ To install somewhere else, pass `--prefix`:
 ```
 
 Uninstalling mirrors it: `./uninstall.sh [--prefix DIR] [--purge]`.
+
+### Packages (.deb / .rpm)
+
+Every release also ships a `.deb` and an `.rpm`. socksy is a shell script, so a
+single architecture-independent package covers every machine:
+
+```bash
+ver=0.5.0
+
+# Debian, Ubuntu, Mint, Pop!_OS...
+curl -LO "https://github.com/Nrentzilas/socksy/releases/download/v/socksy__all.deb"
+sudo apt install "./socksy__all.deb"
+
+# Fedora, RHEL, openSUSE...
+curl -LO "https://github.com/Nrentzilas/socksy/releases/download/v/socksy--1.noarch.rpm"
+sudo dnf install "./socksy--1.noarch.rpm"
+```
+
+A package puts `socksy` in `/usr/bin` instead of `~/.local/bin`, and that is the
+only difference. Everything socksy creates at runtime stays per-user either way:
+the relay, your saved profiles, and the gost binary still live under
+`~/.config/socksy` and `~/.local/bin`. Remove it with `sudo apt remove socksy`
+or `sudo dnf remove socksy`, which leaves that per-user state alone, so run
+`socksy off` first if a proxy is still applied.
+
+Each release carries a `SHA256SUMS` covering all three artifacts:
+
+```bash
+curl -LO "https://github.com/Nrentzilas/socksy/releases/download/v/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+```
 
 ### The relay binary
 
@@ -322,7 +354,7 @@ already resolves at the exit.
 
 | Piece | Location |
 |---|---|
-| `socksy` command | `~/.local/bin/socksy` |
+| `socksy` command | `~/.local/bin/socksy` (`/usr/bin/socksy` from a package) |
 | `gost` relay binary | `~/.local/bin/gost` |
 | systemd user service | `~/.config/systemd/user/socksy-relay.service` |
 | watchdog timer (opt-in) | `~/.config/systemd/user/socksy-watchdog.{service,timer}` |
@@ -371,10 +403,10 @@ Done recently:
 - [x] Per-app proxying (`socksy run`) and one-command rotation (`socksy rotate`)
 - [x] Keep proxy credentials out of the relay's command line
 - [x] `socksy check`: a leak audit (DNS, IPv6, bind, bypass, exit geo) in one command
+- [x] Packaging: a `.deb` and an `.rpm` on every release
 
 Still ahead:
 
-- [ ] Packaging: `.rpm` / `.deb`
 - [ ] Profile pools with automatic failover in the watchdog
 - [ ] GUI / tray applet
 
